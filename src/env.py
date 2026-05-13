@@ -352,6 +352,7 @@ class GoldTradingEnv(gym.Env):
         trade_cooldown: int = 0,
         sl_atr_mult: float = 1.5,
         tp_atr_mult: float = 4.5,
+        use_lstm: bool = False,
     ):
         super().__init__()
 
@@ -368,10 +369,11 @@ class GoldTradingEnv(gym.Env):
         missing = [c for c in feature_columns if c not in df.columns]
         if missing:
             raise ValueError(f"DataFrame missing feature columns: {missing}")
-        if len(df) <= window_size + 10:
+        min_rows = window_size + 10 if not use_lstm else 100
+        if len(df) <= min_rows:
             raise ValueError(
                 f"DataFrame สั้นเกินไป (len={len(df)}) "
-                f"ต้องมากกว่า window_size+10={window_size+10}"
+                f"ต้องมากกว่า {min_rows}"
             )
 
         self.df = df.reset_index(drop=True)
@@ -388,6 +390,7 @@ class GoldTradingEnv(gym.Env):
         self.reward_type = reward_type
         self.max_drawdown_pct = float(max_drawdown_pct)
         self.trade_cooldown = int(trade_cooldown)
+        self.use_lstm = bool(use_lstm)
 
         # TP/SL config (ATR-based)
         self.sl_atr_mult = float(sl_atr_mult)
@@ -398,7 +401,12 @@ class GoldTradingEnv(gym.Env):
 
         # Spaces: 3 actions (Hold, Buy, Sell) — no manual Close
         n_features = len(feature_columns)
-        obs_dim = self.window_size * n_features + 3  # +3 = position info
+        if self.use_lstm:
+            # LSTM mode: single-step features + position info (no window)
+            obs_dim = n_features + 3
+        else:
+            # MLP mode: flattened window + position info
+            obs_dim = self.window_size * n_features + 3
         self.action_space = spaces.Discrete(3)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
@@ -570,9 +578,14 @@ class GoldTradingEnv(gym.Env):
     # Helpers
     # ------------------------------------------------------------------
     def _get_observation(self) -> np.ndarray:
-        start = self.current_step - self.window_size
-        end = self.current_step
-        window = self._features[start:end].flatten()
+        if self.use_lstm:
+            # LSTM mode: just current step features (LSTM handles memory)
+            features = self._features[self.current_step]
+        else:
+            # MLP mode: flattened window of features
+            start = self.current_step - self.window_size
+            end = self.current_step
+            features = self._features[start:end].flatten()
 
         if self.position != 0:
             current_price = float(self._closes[self.current_step])
@@ -587,7 +600,7 @@ class GoldTradingEnv(gym.Env):
             dtype=np.float32,
         )
 
-        obs = np.concatenate([window.astype(np.float32), position_info])
+        obs = np.concatenate([features.astype(np.float32), position_info])
         # safety: NaN/Inf guard
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 

@@ -43,6 +43,13 @@ from src.backtest import (
 from src.data import load_data
 from src.env import GoldTradingEnv
 
+# LSTM support (optional)
+try:
+    from sb3_contrib import RecurrentPPO
+    HAS_RECURRENT = True
+except ImportError:
+    HAS_RECURRENT = False
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,10 +65,11 @@ def make_env_fn(df, env_kwargs, seed, rank=0):
 
 
 def train_fold(train_df, cfg, timesteps, seed):
-    """Train fresh PPO on train_df. Return (model, vec_normalize) — vn is None ถ้าไม่ใช้"""
+    """Train fresh PPO/RecurrentPPO on train_df. Return (model, vec_normalize, use_lstm)"""
     env_kwargs = cfg["env"]
     n_envs = cfg["train"]["n_envs"]
     use_vn = cfg["train"]["use_vec_normalize"]
+    use_lstm = env_kwargs.get("use_lstm", False)
 
     train_env = DummyVecEnv([
         make_env_fn(train_df, env_kwargs, seed, i) for i in range(n_envs)
@@ -70,31 +78,65 @@ def train_fold(train_df, cfg, timesteps, seed):
         train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     ppo_cfg = cfg["ppo"]
-    policy_kwargs = dict(
-        net_arch=dict(pi=ppo_cfg["net_arch"]["pi"], vf=ppo_cfg["net_arch"]["vf"]),
-    )
 
-    model = PPO(
-        policy=ppo_cfg["policy"],
-        env=train_env,
-        learning_rate=ppo_cfg["learning_rate"],
-        n_steps=ppo_cfg["n_steps"],
-        batch_size=ppo_cfg["batch_size"],
-        n_epochs=ppo_cfg["n_epochs"],
-        gamma=ppo_cfg["gamma"],
-        gae_lambda=ppo_cfg["gae_lambda"],
-        clip_range=ppo_cfg["clip_range"],
-        ent_coef=ppo_cfg["ent_coef"],
-        vf_coef=ppo_cfg["vf_coef"],
-        max_grad_norm=ppo_cfg["max_grad_norm"],
-        policy_kwargs=policy_kwargs,
-        verbose=0,
-        seed=seed,
-        device="auto",
-    )
+    if use_lstm:
+        # RecurrentPPO with LSTM
+        if not HAS_RECURRENT:
+            raise ImportError("sb3-contrib required for LSTM. pip install sb3-contrib")
+
+        lstm_hidden = ppo_cfg.get("lstm_hidden_size", 128)
+        policy_kwargs = dict(
+            net_arch=dict(pi=ppo_cfg["net_arch"]["pi"], vf=ppo_cfg["net_arch"]["vf"]),
+            lstm_hidden_size=lstm_hidden,
+            n_lstm_layers=1,
+        )
+
+        model = RecurrentPPO(
+            policy=ppo_cfg["policy"],  # "MlpLstmPolicy"
+            env=train_env,
+            learning_rate=ppo_cfg["learning_rate"],
+            n_steps=ppo_cfg["n_steps"],
+            batch_size=ppo_cfg["batch_size"],
+            n_epochs=ppo_cfg["n_epochs"],
+            gamma=ppo_cfg["gamma"],
+            gae_lambda=ppo_cfg["gae_lambda"],
+            clip_range=ppo_cfg["clip_range"],
+            ent_coef=ppo_cfg["ent_coef"],
+            vf_coef=ppo_cfg["vf_coef"],
+            max_grad_norm=ppo_cfg["max_grad_norm"],
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+            seed=seed,
+            device="cpu",  # RecurrentPPO better on CPU for MLP+LSTM
+        )
+    else:
+        # Standard PPO with MLP
+        policy_kwargs = dict(
+            net_arch=dict(pi=ppo_cfg["net_arch"]["pi"], vf=ppo_cfg["net_arch"]["vf"]),
+        )
+
+        model = PPO(
+            policy=ppo_cfg["policy"],
+            env=train_env,
+            learning_rate=ppo_cfg["learning_rate"],
+            n_steps=ppo_cfg["n_steps"],
+            batch_size=ppo_cfg["batch_size"],
+            n_epochs=ppo_cfg["n_epochs"],
+            gamma=ppo_cfg["gamma"],
+            gae_lambda=ppo_cfg["gae_lambda"],
+            clip_range=ppo_cfg["clip_range"],
+            ent_coef=ppo_cfg["ent_coef"],
+            vf_coef=ppo_cfg["vf_coef"],
+            max_grad_norm=ppo_cfg["max_grad_norm"],
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+            seed=seed,
+            device="auto",
+        )
+
     model.learn(total_timesteps=timesteps, progress_bar=True)
 
-    return model, (train_env if use_vn else None)
+    return model, (train_env if use_vn else None), use_lstm
 
 
 def buy_and_hold_equity_return(test_df, env_kwargs):
@@ -119,18 +161,32 @@ def buy_and_hold_equity_return(test_df, env_kwargs):
     return (final_equity / initial - 1) * 100
 
 
-def backtest_fold(test_df, cfg, model, vn):
+def backtest_fold(test_df, cfg, model, vn, use_lstm=False):
     """Run trained model on test_df. Return metrics dict + equity curve."""
     env_kwargs = cfg["env"]
     raw_env = GoldTradingEnv(test_df, **env_kwargs)
 
     obs, _ = raw_env.reset()
+
+    # LSTM state tracking
+    lstm_state = None
+    episode_start = np.ones((1,), dtype=bool)
+
     while True:
         if vn is not None:
             norm_obs = vn.normalize_obs(obs[None, :])[0]
         else:
             norm_obs = obs
-        action, _ = model.predict(norm_obs, deterministic=True)
+
+        if use_lstm:
+            action, lstm_state = model.predict(
+                norm_obs, state=lstm_state,
+                episode_start=episode_start, deterministic=True
+            )
+            episode_start = np.zeros((1,), dtype=bool)
+        else:
+            action, _ = model.predict(norm_obs, deterministic=True)
+
         action = int(np.asarray(action).flatten()[0])
         obs, _, term, trunc, _ = raw_env.step(action)
         if term or trunc:
@@ -237,10 +293,10 @@ def main():
         print(f"{'─' * 70}")
 
         print(f" [train] fold {i+1}...")
-        model, vn = train_fold(train_df, cfg, args.timesteps, args.seed + i * 100)
+        model, vn, use_lstm = train_fold(train_df, cfg, args.timesteps, args.seed + i * 100)
 
         print(f" [test]  fold {i+1}...")
-        m = backtest_fold(test_df, cfg, model, vn)
+        m = backtest_fold(test_df, cfg, model, vn, use_lstm=use_lstm)
         m["fold"] = i + 1
         m["start_row"] = start_idx
         results.append(m)
