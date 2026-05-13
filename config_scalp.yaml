@@ -1,0 +1,61 @@
+# ============================================================
+#  Gold Trading Bot — Scalping Config (M15)
+#  Sniper entries on M15, Daily trend as macro filter
+#  FVG + structure features in observation
+# ============================================================
+
+data:
+  source: "csv"
+  symbol: "XAUUSD.iux"
+  interval: "15m"                # M15 scalping
+  period: null                   # not used for CSV
+  csv_path: "./data/xauusd_m15.csv"
+  csv_daily_path: "./data/xauusd_d1.csv"   # daily macro features
+  train_test_split: 0.8
+  use_multi_timeframe: true      # M15 + Daily features
+
+env:
+  initial_balance: 10000.0
+  lot_size: 0.01                 # mini lot (0.01 lot = 1 oz)
+  spread: 0.16                   # IUX spread ~16 points = $0.16
+  commission: 0.07               # commission per trade (USD)
+  contract_size: 100.0           # 100 oz / standard lot
+  max_position: 1
+  window_size: 30                # 30 M15 candles = 7.5 hours lookback
+  reward_type: "scalp_sniper_v2"      # v2: fixed TP/SL rewards, best performing
+  max_drawdown_pct: 0.5
+  trade_cooldown: 0                   # no cooldown — agent learns entry quality via reward
+  sl_atr_mult: 1.5                   # SL = 1.5 × ATR
+  tp_atr_mult: 4.5                   # TP = 4.5 × ATR → RR 1:3
+
+ppo:
+  policy: "MlpPolicy"
+  learning_rate: 3.0e-4          # higher LR for M15 (more data, faster patterns)
+  n_steps: 4096                  # larger rollout (M15 has more steps per episode)
+  batch_size: 128
+  n_epochs: 10
+  gamma: 0.995                   # slightly higher discount (M15 trades resolve faster)
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  net_arch:
+    pi: [256, 256]
+    vf: [256, 256]
+
+train:
+  total_timesteps: 500000
+  n_envs: 4
+  seed: 42
+  eval_freq: 20000
+  n_eval_episodes: 5
+  checkpoint_freq: 100000
+  use_vec_normalize: true
+
+paths:
+  tensorboard_log: "./logs/ppo_gold_scalp/"
+  checkpoint_dir: "./checkpoints_scalp/"
+  best_model_dir: "./checkpoints_scalp/best/"
+  vecnormalize_path: "./checkpoints_scalp/vec_normalize.pkl"
+  data_cache: "./data/xauusd_m15_cache.csv"

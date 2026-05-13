@@ -1,0 +1,11 @@
+stable-baselines3[extra]==2.3.2
+gymnasium==0.29.1
+torch>=2.0
+pandas>=2.0
+numpy>=1.24,<2.0
+ta>=0.11.0
+yfinance>=0.2.40
+pyyaml>=6.0
+tensorboard>=2.15
+matplotlib>=3.7
+rich>=13.0

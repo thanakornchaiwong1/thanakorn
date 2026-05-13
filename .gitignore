@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Data files (too large for git)
+data/*.csv
+data/*.pkl
+
+# Model checkpoints & logs
+checkpoints*/
+logs/
+*.zip
+*.pkl
+
+# Output artifacts
+backtest_output/
+walk_forward_output/
+inspect_output/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
