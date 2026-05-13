@@ -235,6 +235,12 @@ def main():
                         help="Override tp_atr_mult in config")
     parser.add_argument("--reward", type=str, default=None,
                         help="Override reward_type in config")
+    parser.add_argument("--exit-mode", type=str, default=None,
+                        help="Override exit_mode: 'fixed' or 'trailing'")
+    parser.add_argument("--trailing-activate", type=float, default=None,
+                        help="Override trailing_activate (ATR mult)")
+    parser.add_argument("--trailing-dist", type=float, default=None,
+                        help="Override trailing_dist (ATR mult)")
     args = parser.parse_args()
 
     if args.quick:
@@ -250,6 +256,12 @@ def main():
         cfg["env"]["tp_atr_mult"] = args.tp_atr
     if args.reward is not None:
         cfg["env"]["reward_type"] = args.reward
+    if args.exit_mode is not None:
+        cfg["env"]["exit_mode"] = args.exit_mode
+    if args.trailing_activate is not None:
+        cfg["env"]["trailing_activate"] = args.trailing_activate
+    if args.trailing_dist is not None:
+        cfg["env"]["trailing_dist"] = args.trailing_dist
 
     sl = cfg["env"].get("sl_atr_mult", 1.5)
     tp = cfg["env"].get("tp_atr_mult", 4.5)

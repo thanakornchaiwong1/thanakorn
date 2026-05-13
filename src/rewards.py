@@ -794,6 +794,206 @@ def scalp_sniper_v6_reward(env, ctx: Dict[str, Any]) -> float:
     return float(np.clip(reward, -1.0, 1.0))
 
 
+def style_sniper_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Style A: SNIPER — few trades, high RR (1:3 to 1:5)
+
+    Philosophy: Wait for triple confluence (trend + structure + momentum),
+    enter 1 trade, win big. Heavy entry cost forces extreme selectivity.
+    Target: 50-100 trades per fold.
+
+    Reward:  TP=+0.15, SL=-0.05  |  Entry cost=-0.01  |  Confluence bonus
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+    reward = 0.0
+
+    # 1. Fixed TP/SL outcome
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        if pnl > 0:
+            reward += 0.15   # big win
+        else:
+            reward -= 0.05   # controlled loss
+
+    # 2. Entry: heavy cost + triple confluence bonus
+    if action in (1, 2) and not invalid:
+        new_pos = 1 if action == 1 else -1
+        reward -= 0.01  # heavy entry cost — forces selectivity
+
+        confluence = 0
+        # (a) Trend alignment
+        if "d_trend_strength" in env.df.columns:
+            trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+            if new_pos * trend > 0.3:
+                confluence += 1
+                reward += 0.005
+            elif new_pos * trend < -0.3:
+                reward -= 0.02  # counter-trend = heavy penalty
+
+        # (b) D/S zone proximity
+        if "ds_distance" in env.df.columns:
+            ds_dist = abs(float(env.df["ds_distance"].iloc[env.current_step]))
+            has_demand = float(env.df["demand_active"].iloc[env.current_step]) > 0.5
+            has_supply = float(env.df["supply_active"].iloc[env.current_step]) > 0.5
+            ds_aligned = (new_pos == 1 and has_demand) or (new_pos == -1 and has_supply)
+            if ds_aligned and ds_dist < 1.0:
+                confluence += 1
+                reward += 0.008
+
+        # (c) Strong candle confirmation
+        if "candle_body_ratio" in env.df.columns:
+            body = float(env.df["candle_body_ratio"].iloc[env.current_step])
+            if body > 0.6:  # strong directional candle
+                confluence += 1
+                reward += 0.005
+
+        # Triple confluence mega-bonus
+        if confluence >= 3:
+            reward += 0.01  # all three aligned = perfect sniper setup
+
+    # 3. Trend ride bonus
+    if env.position != 0 and "d_trend_strength" in env.df.columns:
+        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+        aligned = env.position * trend
+        if aligned > 0:
+            reward += 0.001 * min(aligned, 1.0)
+
+    # 4. Invalid
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
+def style_scalp_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Style B: SCALPING — frequent trades, low RR (1:1 to 1:2), high WR needed
+
+    Philosophy: Quick in, quick out. Grab small moves.
+    Breakeven WR: 50% (1:1) or 33% (1:2). Need WR > 55%.
+    Target: 300-500 trades per fold.
+
+    Reward:  TP=+0.06, SL=-0.04  |  Momentum bonus  |  Session bonus
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+    reward = 0.0
+
+    # 1. TP/SL outcome — tighter ratio (reflects 1:1-1:2 RR)
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        if pnl > 0:
+            reward += 0.06   # smaller win
+        else:
+            reward -= 0.04   # smaller loss
+
+    # 2. Entry: light cost + momentum focus
+    if action in (1, 2) and not invalid:
+        new_pos = 1 if action == 1 else -1
+        reward -= 0.001  # light entry cost — allow frequent trading
+
+        # (a) Momentum: strong candle = good for scalping
+        if "candle_body_ratio" in env.df.columns:
+            body = float(env.df["candle_body_ratio"].iloc[env.current_step])
+            if body > 0.5:
+                reward += 0.003
+
+        # (b) Session: scalping works best during active sessions
+        if "is_active_session" in env.df.columns:
+            is_active = float(env.df["is_active_session"].iloc[env.current_step])
+            if is_active > 0.5:
+                reward += 0.003
+            else:
+                reward -= 0.003  # scalping during Asian = bad
+
+        # (c) Trend alignment (mild)
+        if "d_trend_strength" in env.df.columns:
+            trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+            if new_pos * trend > 0.2:
+                reward += 0.003
+            elif new_pos * trend < -0.3:
+                reward -= 0.005
+
+    # 3. No trend ride (scalp = quick exit, not hold)
+
+    # 4. Invalid
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
+def style_ds_trailing_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Style C: DEMAND/SUPPLY + TRAILING STOP — enter at zones, let profits run
+
+    Philosophy: Enter at institutional zones, use trailing stop to ride trends.
+    No fixed TP — trailing stop captures big moves and cuts small ones.
+    Target: 150-250 trades per fold.
+
+    Reward: PnL-proportional (variable TP) + D/S zone bonus + trend ride
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+    reward = 0.0
+
+    # 1. Trade outcome — PnL-proportional (trailing = variable profit)
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        if pnl > 0:
+            # Scale reward with profit size (trailing can produce big wins)
+            reward += min(pnl * 40.0, 0.30)   # cap at 0.30 for huge wins
+        else:
+            reward -= 0.04   # fixed loss penalty (SL is fixed)
+
+    # 2. Entry: D/S zone focused
+    if action in (1, 2) and not invalid:
+        new_pos = 1 if action == 1 else -1
+        reward -= 0.005  # moderate entry cost
+
+        # (a) D/S zone alignment — THE key entry signal
+        if "ds_distance" in env.df.columns:
+            ds_dist = abs(float(env.df["ds_distance"].iloc[env.current_step]))
+            ds_fresh = float(env.df["ds_freshness"].iloc[env.current_step])
+            has_demand = float(env.df["demand_active"].iloc[env.current_step]) > 0.5
+            has_supply = float(env.df["supply_active"].iloc[env.current_step]) > 0.5
+            ds_aligned = (new_pos == 1 and has_demand) or (new_pos == -1 and has_supply)
+
+            if ds_aligned and ds_dist < 1.5:
+                reward += 0.02 * (1.5 - ds_dist) / 1.5  # max +0.02
+                if ds_fresh > 0.5:
+                    reward += 0.01  # fresh zone = strong signal
+            elif not has_demand and not has_supply:
+                reward -= 0.01  # no zone = no structure
+
+        # (b) Trend alignment
+        if "d_trend_strength" in env.df.columns:
+            trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+            if new_pos * trend > 0.3:
+                reward += 0.008
+            elif new_pos * trend < -0.3:
+                reward -= 0.015
+
+    # 3. Trend ride bonus (STRONGER than other styles — trailing = ride trend)
+    if env.position != 0 and "d_trend_strength" in env.df.columns:
+        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+        aligned = env.position * trend
+        if aligned > 0:
+            reward += 0.002 * min(aligned, 1.0)  # 2x stronger ride bonus
+        elif aligned < -0.3:
+            reward -= 0.001
+
+    # 4. Invalid
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -810,6 +1010,9 @@ REWARD_REGISTRY: Dict[str, Callable] = {
     "scalp_sniper_v4": scalp_sniper_v4_reward,
     "scalp_sniper_v5": scalp_sniper_v5_reward,
     "scalp_sniper_v6": scalp_sniper_v6_reward,
+    "style_sniper": style_sniper_reward,
+    "style_scalp": style_scalp_reward,
+    "style_ds_trailing": style_ds_trailing_reward,
 }
 
 

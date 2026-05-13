@@ -516,6 +516,9 @@ class GoldTradingEnv(gym.Env):
         sl_atr_mult: float = 1.5,
         tp_atr_mult: float = 4.5,
         use_lstm: bool = False,
+        exit_mode: str = "fixed",           # "fixed" = TP/SL, "trailing" = trailing stop
+        trailing_activate: float = 1.5,     # activate trailing after X ATR profit
+        trailing_dist: float = 1.0,         # trail distance in ATR
     ):
         super().__init__()
 
@@ -558,6 +561,11 @@ class GoldTradingEnv(gym.Env):
         # TP/SL config (ATR-based)
         self.sl_atr_mult = float(sl_atr_mult)
         self.tp_atr_mult = float(tp_atr_mult)
+
+        # Trailing stop config
+        self.exit_mode = exit_mode            # "fixed" or "trailing"
+        self.trailing_activate = float(trailing_activate)
+        self.trailing_dist = float(trailing_dist)
 
         # Reward fn
         self._reward_fn = get_reward_fn(reward_type)
@@ -604,6 +612,8 @@ class GoldTradingEnv(gym.Env):
         self.entry_step = 0
         self._tp_price = 0.0       # take profit level
         self._sl_price = 0.0       # stop loss level
+        self._best_price = 0.0     # best favorable price (for trailing stop)
+        self._trailing_active = False  # whether trailing stop is activated
         self.total_trades = 0
         self.winning_trades = 0
         self.trade_returns: list[float] = []
@@ -636,6 +646,25 @@ class GoldTradingEnv(gym.Env):
 
         # ---- Check TP/SL FIRST (before new actions) ----
         if self.position != 0:
+            # ---- Trailing stop: update best price & move SL ----
+            if self.exit_mode == "trailing":
+                atr_now = float(self._atr[self.current_step])
+                if atr_now > 0:
+                    if self.position == 1:  # Long
+                        self._best_price = max(self._best_price, current_high)
+                        profit_atr = (self._best_price - self.entry_price) / atr_now
+                        if profit_atr >= self.trailing_activate:
+                            self._trailing_active = True
+                            new_sl = self._best_price - self.trailing_dist * atr_now
+                            self._sl_price = max(self._sl_price, new_sl)
+                    else:  # Short
+                        self._best_price = min(self._best_price, current_low)
+                        profit_atr = (self.entry_price - self._best_price) / atr_now
+                        if profit_atr >= self.trailing_activate:
+                            self._trailing_active = True
+                            new_sl = self._best_price + self.trailing_dist * atr_now
+                            self._sl_price = min(self._sl_price, new_sl)
+
             hit_tp = False
             hit_sl = False
 
@@ -669,6 +698,8 @@ class GoldTradingEnv(gym.Env):
                 self.entry_price = 0.0
                 self._tp_price = 0.0
                 self._sl_price = 0.0
+                self._best_price = 0.0
+                self._trailing_active = False
 
         # ---- Execute action (only if flat) ----
         if action == self.BUY:
@@ -682,7 +713,12 @@ class GoldTradingEnv(gym.Env):
 
                     # Set TP/SL levels
                     self._sl_price = self.entry_price - self.sl_atr_mult * atr
-                    self._tp_price = self.entry_price + self.tp_atr_mult * atr
+                    if self.exit_mode == "trailing":
+                        self._tp_price = self.entry_price + 99.0 * atr  # effectively no fixed TP
+                        self._best_price = self.entry_price
+                        self._trailing_active = False
+                    else:
+                        self._tp_price = self.entry_price + self.tp_atr_mult * atr
             else:
                 invalid_action = True
 
@@ -697,7 +733,12 @@ class GoldTradingEnv(gym.Env):
 
                     # Set TP/SL levels (reversed for short)
                     self._sl_price = self.entry_price + self.sl_atr_mult * atr
-                    self._tp_price = self.entry_price - self.tp_atr_mult * atr
+                    if self.exit_mode == "trailing":
+                        self._tp_price = self.entry_price - 99.0 * atr  # effectively no fixed TP
+                        self._best_price = self.entry_price
+                        self._trailing_active = False
+                    else:
+                        self._tp_price = self.entry_price - self.tp_atr_mult * atr
             else:
                 invalid_action = True
 
