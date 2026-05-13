@@ -229,6 +229,12 @@ def main():
     parser.add_argument("--quick", action="store_true",
                         help="Quick mode: 50k steps/fold (~3 นาที/fold)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--sl-atr", type=float, default=None,
+                        help="Override sl_atr_mult in config")
+    parser.add_argument("--tp-atr", type=float, default=None,
+                        help="Override tp_atr_mult in config")
+    parser.add_argument("--reward", type=str, default=None,
+                        help="Override reward_type in config")
     args = parser.parse_args()
 
     if args.quick:
@@ -236,6 +242,18 @@ def main():
 
     with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
+    # CLI overrides for SL/TP/reward
+    if args.sl_atr is not None:
+        cfg["env"]["sl_atr_mult"] = args.sl_atr
+    if args.tp_atr is not None:
+        cfg["env"]["tp_atr_mult"] = args.tp_atr
+    if args.reward is not None:
+        cfg["env"]["reward_type"] = args.reward
+
+    sl = cfg["env"].get("sl_atr_mult", 1.5)
+    tp = cfg["env"].get("tp_atr_mult", 4.5)
+    rr = tp / sl
 
     print("=" * 70)
     print(" WALK-FORWARD VALIDATION")
@@ -245,6 +263,8 @@ def main():
     print(f"  step size:    {args.step_size:,} rows")
     print(f"  timesteps/fold: {args.timesteps:,}")
     print(f"  mode: {'QUICK (smoke test)' if args.quick else 'FULL'}")
+    print(f"  SL/TP: {sl:.1f} / {tp:.1f} ATR  (RR 1:{rr:.1f})")
+    print(f"  reward: {cfg['env']['reward_type']}")
 
     print("\nLoading data...")
     df = load_data(cfg)

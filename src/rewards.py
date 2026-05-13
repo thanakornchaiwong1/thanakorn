@@ -487,6 +487,313 @@ def scalp_sniper_v3_reward(env, ctx: Dict[str, Any]) -> float:
     return float(np.clip(reward, -1.0, 1.0))
 
 
+def scalp_sniper_v4_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Reward v4 — RR-adaptive + volatility-aware.
+
+    Key improvements from data-driven analysis:
+      1. TP/SL reward automatically scales with actual RR ratio from env config
+         → works correctly for RR 1:2, 1:3, 1:5 etc.
+      2. Volatility awareness: bonus for high-ATR entries (data shows high vol = better WR)
+      3. Kept FVG + trend components (v2 vs v3 test proved FVG bonus helps)
+      4. Wider SL compatible (designed for SL 2.0 ATR which reduces noise stops from 38% to 23%)
+
+    Reward math:
+      SL penalty fixed at -0.04
+      TP reward = 0.04 * RR (e.g., 0.08 for 1:2, 0.12 for 1:3, 0.20 for 1:5)
+      Breakeven WR in reward space always matches the actual breakeven WR
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+
+    reward = 0.0
+
+    # ============================================================
+    # Component 1: RR-Adaptive TP/SL Outcome
+    #   Dynamically reads RR from env config
+    #   SL penalty = -0.04 (fixed)
+    #   TP reward  = +0.04 * RR → breakeven WR matches actual
+    # ============================================================
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        rr = env.tp_atr_mult / max(env.sl_atr_mult, 0.01)  # e.g. 2.0, 3.0, 5.0
+        if pnl > 0:   # TP hit
+            reward += 0.04 * rr  # +0.08 for 1:2, +0.12 for 1:3, +0.20 for 1:5
+        else:          # SL hit
+            reward -= 0.04
+
+    # ============================================================
+    # Component 2: Entry Quality Score
+    #   (a) FVG alignment (proven useful: v2 > v3)
+    #   (b) Trend alignment
+    #   (c) Volatility bonus (data: high ATR = 28.7% WR vs low ATR = 25.7%)
+    # ============================================================
+    if action in (1, 2) and not invalid:
+        new_pos = 1 if action == 1 else -1
+        quality = 0.0
+
+        # (a) FVG alignment
+        if "fvg_distance" in env.df.columns:
+            fvg_dist = abs(float(env.df["fvg_distance"].iloc[env.current_step]))
+            fvg_str = float(env.df["fvg_strength"].iloc[env.current_step])
+
+            has_bull = float(env.df["fvg_bull_active"].iloc[env.current_step]) > 0.5
+            has_bear = float(env.df["fvg_bear_active"].iloc[env.current_step]) > 0.5
+            fvg_aligned = (new_pos == 1 and has_bull) or (new_pos == -1 and has_bear)
+
+            if fvg_aligned and fvg_dist < 1.5:
+                quality += 0.03 * (1.5 - fvg_dist) / 1.5
+                if fvg_str > 0.5:
+                    quality += 0.015
+            elif not has_bull and not has_bear:
+                quality -= 0.015
+
+        # (b) Trend alignment at entry
+        if "d_trend_strength" in env.df.columns:
+            trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+            aligned = new_pos * trend
+            if aligned > 0.3:
+                quality += 0.01
+            elif aligned < -0.3:
+                quality -= 0.02
+
+        # (c) Volatility bonus: reward entries during high-vol periods
+        if "atr_ratio" in env.df.columns:
+            atr_ratio = float(env.df["atr_ratio"].iloc[env.current_step])
+            # atr_ratio typical range: 0.001 - 0.01
+            # High vol (> 75th percentile ~0.003) → bonus
+            if atr_ratio > 0.003:
+                quality += 0.005
+            elif atr_ratio < 0.001:
+                quality -= 0.005  # low vol → discourage entry
+
+        reward += quality
+
+    # ============================================================
+    # Component 3: Trend Ride Bonus (dense, per-step)
+    # ============================================================
+    if env.position != 0 and "d_trend_strength" in env.df.columns:
+        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+        aligned = env.position * trend
+        if aligned > 0:
+            reward += 0.001 * min(aligned, 1.0)
+        elif aligned < -0.3:
+            reward -= 0.0005
+
+    # ============================================================
+    # Component 4: Invalid Action Penalty
+    # ============================================================
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
+def scalp_sniper_v5_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Reward v5 — Demand/Supply zone overhaul.
+
+    Key changes from v2:
+      - FVG replaced with Demand/Supply zone entry quality
+      - Session awareness: bonus for entering during active sessions (London/NY)
+      - Freshness: untested D/S zones get higher reward
+      - Fixed TP/SL rewards (same as v2 which was best performer)
+
+    Components:
+      1. Fixed TP/SL outcome    (+0.12 / -0.04)   — proven best in v2
+      2. D/S zone entry quality (sparse, at entry)  — replaces FVG
+      3. Trend alignment        (sparse + dense)    — daily trend edge
+      4. Session bonus          (sparse, at entry)  — active session = better
+      5. Invalid action penalty
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+
+    reward = 0.0
+
+    # ============================================================
+    # Component 1: Fixed TP/SL Outcome (same as v2 — proven best)
+    # ============================================================
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        if pnl > 0:   # TP hit
+            reward += 0.12
+        else:          # SL hit
+            reward -= 0.04
+
+    # ============================================================
+    # Component 2: D/S Zone Entry Quality (replaces FVG)
+    #   Buy near demand zone = institutional buy area = quality entry
+    #   Sell near supply zone = institutional sell area = quality entry
+    #   Freshness matters: untested zones are stronger signals
+    # ============================================================
+    if action in (1, 2) and not invalid:
+        new_pos = 1 if action == 1 else -1
+        quality = 0.0
+
+        if "ds_distance" in env.df.columns:
+            ds_dist = abs(float(env.df["ds_distance"].iloc[env.current_step]))
+            ds_str = float(env.df["ds_strength"].iloc[env.current_step])
+            ds_fresh = float(env.df["ds_freshness"].iloc[env.current_step])
+
+            has_demand = float(env.df["demand_active"].iloc[env.current_step]) > 0.5
+            has_supply = float(env.df["supply_active"].iloc[env.current_step]) > 0.5
+
+            # Aligned: buy near demand, sell near supply
+            ds_aligned = (new_pos == 1 and has_demand) or (new_pos == -1 and has_supply)
+
+            if ds_aligned and ds_dist < 1.5:
+                # Near aligned D/S zone — institutional order area
+                proximity_bonus = 0.03 * (1.5 - ds_dist) / 1.5   # 0 to +0.03
+                strength_bonus = 0.015 * ds_str if ds_str > 0.3 else 0.0
+                freshness_bonus = 0.01 * ds_fresh   # untested = +0.01, tested = less
+                quality += proximity_bonus + strength_bonus + freshness_bonus
+            elif not has_demand and not has_supply:
+                # No D/S structure at all — random entry
+                quality -= 0.015
+
+        # Trend alignment at entry
+        if "d_trend_strength" in env.df.columns:
+            trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+            aligned = new_pos * trend
+            if aligned > 0.3:
+                quality += 0.01
+            elif aligned < -0.3:
+                quality -= 0.02
+
+        # Session bonus: entering during active session (London/NY)
+        if "is_active_session" in env.df.columns:
+            is_active = float(env.df["is_active_session"].iloc[env.current_step])
+            if is_active > 0.5:
+                quality += 0.005  # active session = higher vol = better moves
+
+        reward += quality
+
+    # ============================================================
+    # Component 3: Trend Ride Bonus (dense, per-step)
+    # ============================================================
+    if env.position != 0 and "d_trend_strength" in env.df.columns:
+        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+        aligned = env.position * trend
+        if aligned > 0:
+            reward += 0.001 * min(aligned, 1.0)
+        elif aligned < -0.3:
+            reward -= 0.0005
+
+    # ============================================================
+    # Component 4: Invalid Action Penalty
+    # ============================================================
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
+def scalp_sniper_v6_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Reward v6 — Anti-overtrade: v2 base + entry cost + D/S awareness.
+
+    Root cause from analysis:
+      - v2 (best: +0.50%) had avg 297 trades/fold
+      - v5 (worst: -1.55%) had avg 374 trades/fold (+26% overtrade)
+      - More trades = more commission drag = worse performance
+      - The agent needs DISINCENTIVE to enter unless confident
+
+    Design:
+      1. Fixed TP/SL outcome: +0.12 / -0.04 (proven in v2)
+      2. Entry COST: -0.003 per entry (makes agent think twice)
+      3. D/S zone bonus at entry (SMALLER than v5 — max +0.025 vs +0.055)
+      4. FVG bonus at entry (from v2 — proven helpful)
+      5. Trend alignment (from v2)
+      6. Trend ride bonus (from v2)
+
+    Expected behavior: agent enters ~200-250 trades/fold (vs 300-400 before)
+    Only enters when D/S + FVG + trend all confirm = high-quality setup
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+
+    reward = 0.0
+
+    # ============================================================
+    # Component 1: Fixed TP/SL Outcome (proven best in v2)
+    # ============================================================
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        if pnl > 0:   # TP hit
+            reward += 0.12
+        else:          # SL hit
+            reward -= 0.04
+
+    # ============================================================
+    # Component 2: Entry Quality + Entry Cost
+    #   Entry cost: -0.003 per entry REGARDLESS of quality
+    #   This forces agent to only enter when expected reward > 0.003
+    #   Quality bonuses can offset cost for good setups
+    # ============================================================
+    if action in (1, 2) and not invalid:
+        new_pos = 1 if action == 1 else -1
+
+        # Entry cost — THE key anti-overtrade mechanism
+        reward -= 0.003
+
+        # (a) D/S zone bonus (HALF the magnitude of v5)
+        if "ds_distance" in env.df.columns:
+            ds_dist = abs(float(env.df["ds_distance"].iloc[env.current_step]))
+            ds_str = float(env.df["ds_strength"].iloc[env.current_step])
+            ds_fresh = float(env.df["ds_freshness"].iloc[env.current_step])
+
+            has_demand = float(env.df["demand_active"].iloc[env.current_step]) > 0.5
+            has_supply = float(env.df["supply_active"].iloc[env.current_step]) > 0.5
+            ds_aligned = (new_pos == 1 and has_demand) or (new_pos == -1 and has_supply)
+
+            if ds_aligned and ds_dist < 1.5:
+                reward += 0.015 * (1.5 - ds_dist) / 1.5  # max +0.015
+                if ds_fresh > 0.5:
+                    reward += 0.005  # fresh zone bonus
+
+        # (b) FVG bonus (from v2 — proven to help)
+        if "fvg_distance" in env.df.columns:
+            fvg_dist = abs(float(env.df["fvg_distance"].iloc[env.current_step]))
+            has_bull = float(env.df["fvg_bull_active"].iloc[env.current_step]) > 0.5
+            has_bear = float(env.df["fvg_bear_active"].iloc[env.current_step]) > 0.5
+            fvg_aligned = (new_pos == 1 and has_bull) or (new_pos == -1 and has_bear)
+
+            if fvg_aligned and fvg_dist < 1.5:
+                reward += 0.01 * (1.5 - fvg_dist) / 1.5  # max +0.01
+
+        # (c) Trend alignment at entry
+        if "d_trend_strength" in env.df.columns:
+            trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+            aligned = new_pos * trend
+            if aligned > 0.3:
+                reward += 0.008
+            elif aligned < -0.3:
+                reward -= 0.015  # counter-trend penalty
+
+    # ============================================================
+    # Component 3: Trend Ride Bonus (dense, from v2)
+    # ============================================================
+    if env.position != 0 and "d_trend_strength" in env.df.columns:
+        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+        aligned = env.position * trend
+        if aligned > 0:
+            reward += 0.001 * min(aligned, 1.0)
+        elif aligned < -0.3:
+            reward -= 0.0005
+
+    # ============================================================
+    # Component 4: Invalid Action Penalty
+    # ============================================================
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -500,6 +807,9 @@ REWARD_REGISTRY: Dict[str, Callable] = {
     "scalp_sniper": scalp_sniper_reward,
     "scalp_sniper_v2": scalp_sniper_v2_reward,
     "scalp_sniper_v3": scalp_sniper_v3_reward,
+    "scalp_sniper_v4": scalp_sniper_v4_reward,
+    "scalp_sniper_v5": scalp_sniper_v5_reward,
+    "scalp_sniper_v6": scalp_sniper_v6_reward,
 }
 
 

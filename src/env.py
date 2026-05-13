@@ -31,17 +31,25 @@ except ImportError:
 
 FEATURE_COLUMNS = [
     "returns",
-    "log_returns",
     "rsi",
     "sma_ratio",
     "macd_diff",
     "bb_position",
     "atr_ratio",
-    # Price action: Fair Value Gap
+    # Price action: Demand/Supply zones (institutional order flow)
+    "demand_active",
+    "supply_active",
+    "ds_distance",
+    "ds_strength",
+    "ds_freshness",
+    # Price action: Fair Value Gap (kept — v2 proved it helps as context)
     "fvg_bull_active",
     "fvg_bear_active",
     "fvg_distance",
     "fvg_strength",
+    # Market context
+    "is_active_session",
+    "candle_body_ratio",
 ]
 
 DAILY_FEATURE_COLUMNS = [
@@ -166,6 +174,150 @@ def _compute_fvg_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFra
     return df
 
 
+def _compute_demand_supply_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFrame:
+    """
+    Compute Demand/Supply zone features for the RL agent.
+
+    Demand/Supply zones (Smart Money Concepts / Institutional Order Flow):
+      - Demand zone: the last BEARISH candle before a strong BULLISH move
+        (= institutional buy orders were filled here)
+      - Supply zone: the last BULLISH candle before a strong BEARISH move
+        (= institutional sell orders were filled here)
+
+    A "strong move" = candle body > MOVE_THRESHOLD * ATR
+
+    Features:
+      - demand_active:  1.0 if there's an active demand zone nearby
+      - supply_active:  1.0 if there's an active supply zone nearby
+      - ds_distance:    signed distance from close to nearest zone / ATR
+      - ds_strength:    strength of the move that created the zone (normalized 0-1)
+      - ds_freshness:   1.0 = untested, decays with each test (fresh zones = stronger)
+
+    Key differences from FVG:
+      - D/S zones represent real institutional order flow, not just wick gaps
+      - D/S zones are LESS frequent = more selective signal
+      - Freshness tracking = zone quality degrades with each touch
+      - Longer max age (50 candles vs 20) = institutional memory persists
+    """
+    MOVE_THRESHOLD = 1.0   # strong candle = body > 1.0 * ATR
+    MAX_ZONE_AGE = 50      # zones expire after 50 candles (~12.5h on M15)
+    MAX_TESTS = 3           # zone depleted after 3 touches
+
+    n = len(df)
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+    atr = atr_values.values
+
+    demand_act = np.zeros(n, dtype=np.float32)
+    supply_act = np.zeros(n, dtype=np.float32)
+    ds_dist = np.zeros(n, dtype=np.float32)
+    ds_str = np.zeros(n, dtype=np.float32)
+    ds_fresh = np.zeros(n, dtype=np.float32)
+
+    # Active zones: (zone_low, zone_high, direction, birth_idx, test_count, strength)
+    active_zones: list = []
+
+    for i in range(2, n):
+        cur_atr = atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1e-9
+
+        # --- Detect new zones at candle i ---
+        body = closes[i] - opens[i]  # positive = bullish
+        body_size = abs(body)
+
+        if body_size > MOVE_THRESHOLD * cur_atr:
+            if body > 0:
+                # Strong bullish candle -> demand zone from preceding bearish candle
+                for j in range(i - 1, max(i - 5, -1), -1):
+                    if j < 0:
+                        break
+                    if closes[j] < opens[j]:  # bearish candle = demand zone base
+                        zone_low = lows[j]
+                        zone_high = max(opens[j], closes[j])
+                        strength = body_size / cur_atr
+                        active_zones.append((zone_low, zone_high, 1, i, 0, strength))
+                        break
+            else:
+                # Strong bearish candle -> supply zone from preceding bullish candle
+                for j in range(i - 1, max(i - 5, -1), -1):
+                    if j < 0:
+                        break
+                    if closes[j] > opens[j]:  # bullish candle = supply zone base
+                        zone_low = min(opens[j], closes[j])
+                        zone_high = highs[j]
+                        strength = body_size / cur_atr
+                        active_zones.append((zone_low, zone_high, -1, i, 0, strength))
+                        break
+
+        # --- Update zones: expiry, tests, broken ---
+        surviving = []
+        for zl, zh, direction, birth, tests, strength in active_zones:
+            age = i - birth
+            if age > MAX_ZONE_AGE:
+                continue  # expired
+
+            # Check if price entered the zone this candle
+            if lows[i] <= zh and highs[i] >= zl:
+                tests += 1
+                if tests > MAX_TESTS:
+                    continue  # depleted
+
+            # Check if zone is broken (close through zone)
+            if direction == 1 and closes[i] < zl:  # demand broken
+                continue
+            if direction == -1 and closes[i] > zh:  # supply broken
+                continue
+
+            surviving.append((zl, zh, direction, birth, tests, strength))
+        active_zones = surviving
+
+        # --- Compute features from nearest zone ---
+        if not active_zones:
+            continue
+
+        # Find nearest zone by distance from close to zone midpoint
+        best_dist = float("inf")
+        best_zone = active_zones[0]
+        for zone in active_zones:
+            zl, zh, d, b, t, s = zone
+            mid = (zl + zh) / 2.0
+            dist = abs(closes[i] - mid)
+            if dist < best_dist:
+                best_dist = dist
+                best_zone = zone
+
+        zl, zh, direction, birth, tests, strength = best_zone
+
+        has_demand = any(d == 1 for _, _, d, _, _, _ in active_zones)
+        has_supply = any(d == -1 for _, _, d, _, _, _ in active_zones)
+        demand_act[i] = 1.0 if has_demand else 0.0
+        supply_act[i] = 1.0 if has_supply else 0.0
+
+        # Distance: positive = price above zone, negative = below
+        if closes[i] > zh:
+            raw_dist = closes[i] - zh
+        elif closes[i] < zl:
+            raw_dist = closes[i] - zl
+        else:
+            raw_dist = 0.0  # inside zone
+        ds_dist[i] = np.clip(raw_dist / cur_atr, -3.0, 3.0)
+
+        # Strength: how strong was the creating move (normalized 0-1)
+        ds_str[i] = np.clip(strength / 5.0, 0.0, 1.0)
+
+        # Freshness: 1.0 = untested, decays by 0.33 per test
+        ds_fresh[i] = max(0.0, 1.0 - tests * 0.33)
+
+    df["demand_active"] = demand_act
+    df["supply_active"] = supply_act
+    df["ds_distance"] = ds_dist
+    df["ds_strength"] = ds_str
+    df["ds_freshness"] = ds_fresh
+
+    return df
+
+
 def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame:
     """
     เตรียม technical features จาก OHLC[V] DataFrame
@@ -215,17 +367,28 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
     # --- Fair Value Gap (FVG) features ---
     df = _compute_fvg_features(df, atr_values)
 
-    # --- Time-of-day features (cyclical encoding) ---
-    # Gold has session-dependent behavior: Asian (low vol), London (high vol), NY (high vol)
-    if hasattr(df.index, 'hour'):
-        hour = df.index.hour + df.index.minute / 60.0
-    elif "time" in df.columns:
-        hour = pd.to_datetime(df["time"]).dt.hour + pd.to_datetime(df["time"]).dt.minute / 60.0
-    else:
-        hour = pd.Series(np.zeros(len(df)), index=df.index)
+    # --- Demand/Supply zone features (institutional order flow) ---
+    df = _compute_demand_supply_features(df, atr_values)
 
-    df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0).astype(np.float32)
-    df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0).astype(np.float32)
+    # --- Session feature ---
+    # Gold sessions: Asian 00-08 UTC (low vol), London 08-13 (breakout),
+    # NY overlap 13-17 (highest vol), NY late 17-22 (quiet)
+    # Binary: 1 = active session (London + NY overlap), 0 = quiet (Asian + late)
+    if hasattr(df.index, 'hour'):
+        hour = df.index.hour
+    elif "time" in df.columns:
+        hour = pd.to_datetime(df["time"]).dt.hour
+    else:
+        hour = pd.Series(np.zeros(len(df), dtype=int), index=df.index)
+
+    df["is_active_session"] = ((hour >= 8) & (hour < 17)).astype(np.float32)
+
+    # --- Candle body ratio (momentum indicator) ---
+    # 1.0 = full body marubozu (strong conviction)
+    # 0.0 = doji (complete indecision)
+    candle_range = df["high"] - df["low"]
+    candle_body = (df["close"] - df["open"]).abs()
+    df["candle_body_ratio"] = (candle_body / (candle_range + 1e-9)).clip(0.0, 1.0).astype(np.float32)
 
     df = df.dropna()
     if reset_index:

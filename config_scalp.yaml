@@ -1,36 +1,36 @@
 # ============================================================
 #  Gold Trading Bot — Scalping Config (M15)
-#  Sniper entries on M15, Daily trend as macro filter
-#  FVG + structure features in observation
+#  v6: FVG + D/S zones combined, anti-overtrade entry cost
+#  Best architecture (MLP) + best SL/TP (1.5/4.5 = RR 1:3)
 # ============================================================
 
 data:
   source: "csv"
   symbol: "XAUUSD.iux"
-  interval: "15m"                # M15 scalping
-  period: null                   # not used for CSV
+  interval: "15m"
+  period: null
   csv_path: "./data/xauusd_m15.csv"
-  csv_daily_path: "./data/xauusd_d1.csv"   # daily macro features
+  csv_daily_path: "./data/xauusd_d1.csv"
   train_test_split: 0.8
-  use_multi_timeframe: true      # M15 + Daily features
+  use_multi_timeframe: true
 
 env:
   initial_balance: 10000.0
-  lot_size: 0.01                 # mini lot (0.01 lot = 1 oz)
-  spread: 0.16                   # IUX spread ~16 points = $0.16
-  commission: 0.07               # commission per trade (USD)
-  contract_size: 100.0           # 100 oz / standard lot
+  lot_size: 0.01
+  spread: 0.16
+  commission: 0.07
+  contract_size: 100.0
   max_position: 1
-  window_size: 30                # ignored when use_lstm=true
-  reward_type: "scalp_sniper_v2"      # v2: fixed TP/SL rewards, best performing
+  window_size: 20                    # reduced from 30 (fewer dims for more features)
+  reward_type: "scalp_sniper_v6"     # v6: anti-overtrade + FVG + D/S combined
   max_drawdown_pct: 0.5
-  trade_cooldown: 0                   # no cooldown — agent learns entry quality via reward
-  sl_atr_mult: 1.5                   # SL = 1.5 × ATR
-  tp_atr_mult: 4.5                   # TP = 4.5 × ATR → RR 1:3
-  use_lstm: true                     # LSTM mode: obs = current features only
+  trade_cooldown: 0
+  sl_atr_mult: 1.5                   # proven best from walk-forward
+  tp_atr_mult: 4.5                   # RR 1:3 (proven best)
+  use_lstm: false
 
 ppo:
-  policy: "MlpLstmPolicy"           # LSTM policy from sb3-contrib
+  policy: "MlpPolicy"
   learning_rate: 3.0e-4
   n_steps: 4096
   batch_size: 128
@@ -41,10 +41,10 @@ ppo:
   ent_coef: 0.01
   vf_coef: 0.5
   max_grad_norm: 0.5
-  lstm_hidden_size: 128              # LSTM hidden units
+  lstm_hidden_size: 128
   net_arch:
-    pi: [128]                        # smaller MLP after LSTM (LSTM does heavy lifting)
-    vf: [128]
+    pi: [256, 256]
+    vf: [256, 256]
 
 train:
   total_timesteps: 500000
