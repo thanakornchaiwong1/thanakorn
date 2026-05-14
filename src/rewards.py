@@ -994,6 +994,47 @@ def style_ds_trailing_reward(env, ctx: Dict[str, Any]) -> float:
     return float(np.clip(reward, -1.0, 1.0))
 
 
+def masked_sniper_reward(env, ctx: Dict[str, Any]) -> float:
+    """
+    Reward for Action-Masked Sniper — clean, outcome-focused.
+
+    Action masking already handles WHEN to trade (trend + zone + session).
+    This reward just teaches WHICH valid setups are better.
+
+    NO entry quality bonus needed — masking handles that.
+    Simple: big TP reward, small SL penalty, trend ride bonus.
+
+    TP=+0.12, SL=-0.04, trend_ride=+0.001/step, invalid=-0.01
+    """
+    trade_closed: bool = ctx.get("trade_closed", False)
+    action: int = ctx.get("action", 0)
+    invalid: bool = ctx.get("invalid_action", False)
+    reward = 0.0
+
+    # 1. TP/SL outcome (same proven values as v2)
+    if trade_closed and len(env.trade_returns) > 0:
+        pnl = env.trade_returns[-1]
+        if pnl > 0:
+            reward += 0.12
+        else:
+            reward -= 0.04
+
+    # 2. Trend ride bonus — teach agent to hold in direction of trend
+    if env.position != 0 and "d_trend_strength" in env.df.columns:
+        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+        aligned = env.position * trend
+        if aligned > 0:
+            reward += 0.001 * min(aligned, 1.0)
+        elif aligned < -0.3:
+            reward -= 0.0005
+
+    # 3. Invalid action penalty
+    if invalid:
+        reward -= 0.01
+
+    return float(np.clip(reward, -1.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1013,6 +1054,7 @@ REWARD_REGISTRY: Dict[str, Callable] = {
     "style_sniper": style_sniper_reward,
     "style_scalp": style_scalp_reward,
     "style_ds_trailing": style_ds_trailing_reward,
+    "masked_sniper": masked_sniper_reward,
 }
 
 

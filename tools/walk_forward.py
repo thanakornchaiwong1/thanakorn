@@ -43,12 +43,20 @@ from src.backtest import (
 from src.data import load_data
 from src.env import GoldTradingEnv
 
-# LSTM support (optional)
+# LSTM / Maskable PPO support (optional)
 try:
     from sb3_contrib import RecurrentPPO
     HAS_RECURRENT = True
 except ImportError:
     HAS_RECURRENT = False
+
+try:
+    from sb3_contrib import MaskablePPO
+    from sb3_contrib.common.wrappers import ActionMasker
+    from sb3_contrib.common.maskable.utils import get_action_masks
+    HAS_MASKABLE = True
+except ImportError:
+    HAS_MASKABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +64,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def make_env_fn(df, env_kwargs, seed, rank=0):
+    use_mask = env_kwargs.get("use_action_mask", False)
     def _init():
         env = GoldTradingEnv(df, **env_kwargs)
+        if use_mask:
+            env = ActionMasker(env, lambda e: e.action_masks())
         env = Monitor(env)
         env.reset(seed=seed + rank)
         return env
@@ -65,11 +76,12 @@ def make_env_fn(df, env_kwargs, seed, rank=0):
 
 
 def train_fold(train_df, cfg, timesteps, seed):
-    """Train fresh PPO/RecurrentPPO on train_df. Return (model, vec_normalize, use_lstm)"""
+    """Train fresh PPO/RecurrentPPO/MaskablePPO on train_df. Return (model, vec_normalize, use_lstm, use_mask)"""
     env_kwargs = cfg["env"]
     n_envs = cfg["train"]["n_envs"]
     use_vn = cfg["train"]["use_vec_normalize"]
     use_lstm = env_kwargs.get("use_lstm", False)
+    use_mask = env_kwargs.get("use_action_mask", False)
 
     train_env = DummyVecEnv([
         make_env_fn(train_df, env_kwargs, seed, i) for i in range(n_envs)
@@ -109,6 +121,34 @@ def train_fold(train_df, cfg, timesteps, seed):
             seed=seed,
             device="cpu",  # RecurrentPPO better on CPU for MLP+LSTM
         )
+    elif use_mask:
+        # MaskablePPO — action masking with rule-based filter
+        if not HAS_MASKABLE:
+            raise ImportError("sb3-contrib required for MaskablePPO. pip install sb3-contrib")
+
+        policy_kwargs = dict(
+            net_arch=dict(pi=ppo_cfg["net_arch"]["pi"], vf=ppo_cfg["net_arch"]["vf"]),
+        )
+
+        model = MaskablePPO(
+            policy=ppo_cfg["policy"],
+            env=train_env,
+            learning_rate=ppo_cfg["learning_rate"],
+            n_steps=ppo_cfg["n_steps"],
+            batch_size=ppo_cfg["batch_size"],
+            n_epochs=ppo_cfg["n_epochs"],
+            gamma=ppo_cfg["gamma"],
+            gae_lambda=ppo_cfg["gae_lambda"],
+            clip_range=ppo_cfg["clip_range"],
+            ent_coef=ppo_cfg["ent_coef"],
+            vf_coef=ppo_cfg["vf_coef"],
+            max_grad_norm=ppo_cfg["max_grad_norm"],
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+            seed=seed,
+            device="auto",
+        )
+
     else:
         # Standard PPO with MLP
         policy_kwargs = dict(
@@ -136,7 +176,7 @@ def train_fold(train_df, cfg, timesteps, seed):
 
     model.learn(total_timesteps=timesteps, progress_bar=True)
 
-    return model, (train_env if use_vn else None), use_lstm
+    return model, (train_env if use_vn else None), use_lstm, use_mask
 
 
 def buy_and_hold_equity_return(test_df, env_kwargs):
@@ -161,7 +201,7 @@ def buy_and_hold_equity_return(test_df, env_kwargs):
     return (final_equity / initial - 1) * 100
 
 
-def backtest_fold(test_df, cfg, model, vn, use_lstm=False):
+def backtest_fold(test_df, cfg, model, vn, use_lstm=False, use_mask=False):
     """Run trained model on test_df. Return metrics dict + equity curve."""
     env_kwargs = cfg["env"]
     raw_env = GoldTradingEnv(test_df, **env_kwargs)
@@ -184,6 +224,9 @@ def backtest_fold(test_df, cfg, model, vn, use_lstm=False):
                 episode_start=episode_start, deterministic=True
             )
             episode_start = np.zeros((1,), dtype=bool)
+        elif use_mask:
+            masks = raw_env.action_masks()
+            action, _ = model.predict(norm_obs, action_masks=masks, deterministic=True)
         else:
             action, _ = model.predict(norm_obs, deterministic=True)
 
@@ -325,10 +368,10 @@ def main():
         print(f"{'─' * 70}")
 
         print(f" [train] fold {i+1}...")
-        model, vn, use_lstm = train_fold(train_df, cfg, args.timesteps, args.seed + i * 100)
+        model, vn, use_lstm, use_mask = train_fold(train_df, cfg, args.timesteps, args.seed + i * 100)
 
         print(f" [test]  fold {i+1}...")
-        m = backtest_fold(test_df, cfg, model, vn, use_lstm=use_lstm)
+        m = backtest_fold(test_df, cfg, model, vn, use_lstm=use_lstm, use_mask=use_mask)
         m["fold"] = i + 1
         m["start_row"] = start_idx
         results.append(m)

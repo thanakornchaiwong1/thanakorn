@@ -516,9 +516,10 @@ class GoldTradingEnv(gym.Env):
         sl_atr_mult: float = 1.5,
         tp_atr_mult: float = 4.5,
         use_lstm: bool = False,
-        exit_mode: str = "fixed",           # "fixed" = TP/SL, "trailing" = trailing stop
-        trailing_activate: float = 1.5,     # activate trailing after X ATR profit
-        trailing_dist: float = 1.0,         # trail distance in ATR
+        use_action_mask: bool = False,      # True = hard rule-based entry filter
+        mask_trend_threshold: float = 0.3,  # min |d_trend_strength| for valid entry
+        mask_zone_threshold: float = 1.5,   # max |ds_distance| for valid entry
+        mask_require_session: bool = True,  # require active session for entry
     ):
         super().__init__()
 
@@ -558,14 +559,15 @@ class GoldTradingEnv(gym.Env):
         self.trade_cooldown = int(trade_cooldown)
         self.use_lstm = bool(use_lstm)
 
-        # TP/SL config (ATR-based)
+        # TP/SL config (ATR-based, fixed exit only)
         self.sl_atr_mult = float(sl_atr_mult)
         self.tp_atr_mult = float(tp_atr_mult)
 
-        # Trailing stop config
-        self.exit_mode = exit_mode            # "fixed" or "trailing"
-        self.trailing_activate = float(trailing_activate)
-        self.trailing_dist = float(trailing_dist)
+        # Action masking config
+        self.use_action_mask = bool(use_action_mask)
+        self.mask_trend_threshold = float(mask_trend_threshold)
+        self.mask_zone_threshold = float(mask_zone_threshold)
+        self.mask_require_session = bool(mask_require_session)
 
         # Reward fn
         self._reward_fn = get_reward_fn(reward_type)
@@ -612,8 +614,6 @@ class GoldTradingEnv(gym.Env):
         self.entry_step = 0
         self._tp_price = 0.0       # take profit level
         self._sl_price = 0.0       # stop loss level
-        self._best_price = 0.0     # best favorable price (for trailing stop)
-        self._trailing_active = False  # whether trailing stop is activated
         self.total_trades = 0
         self.winning_trades = 0
         self.trade_returns: list[float] = []
@@ -646,25 +646,6 @@ class GoldTradingEnv(gym.Env):
 
         # ---- Check TP/SL FIRST (before new actions) ----
         if self.position != 0:
-            # ---- Trailing stop: update best price & move SL ----
-            if self.exit_mode == "trailing":
-                atr_now = float(self._atr[self.current_step])
-                if atr_now > 0:
-                    if self.position == 1:  # Long
-                        self._best_price = max(self._best_price, current_high)
-                        profit_atr = (self._best_price - self.entry_price) / atr_now
-                        if profit_atr >= self.trailing_activate:
-                            self._trailing_active = True
-                            new_sl = self._best_price - self.trailing_dist * atr_now
-                            self._sl_price = max(self._sl_price, new_sl)
-                    else:  # Short
-                        self._best_price = min(self._best_price, current_low)
-                        profit_atr = (self.entry_price - self._best_price) / atr_now
-                        if profit_atr >= self.trailing_activate:
-                            self._trailing_active = True
-                            new_sl = self._best_price + self.trailing_dist * atr_now
-                            self._sl_price = min(self._sl_price, new_sl)
-
             hit_tp = False
             hit_sl = False
 
@@ -698,10 +679,14 @@ class GoldTradingEnv(gym.Env):
                 self.entry_price = 0.0
                 self._tp_price = 0.0
                 self._sl_price = 0.0
-                self._best_price = 0.0
-                self._trailing_active = False
 
         # ---- Execute action (only if flat) ----
+        # Direction-invariant: BUY = "trade with trend"
+        # In bearish trend, BUY actually opens a SHORT position
+        trend_dir = self._get_trend_direction()
+        if action == self.BUY and trend_dir == -1:
+            action = self.SELL  # remap BUY → SHORT when bearish
+
         if action == self.BUY:
             if self.position == 0 and not in_cooldown:
                 atr = float(self._atr[self.current_step])
@@ -711,14 +696,9 @@ class GoldTradingEnv(gym.Env):
                     self.entry_step = self.current_step
                     self.balance -= self.commission
 
-                    # Set TP/SL levels
+                    # Set TP/SL levels (fixed)
                     self._sl_price = self.entry_price - self.sl_atr_mult * atr
-                    if self.exit_mode == "trailing":
-                        self._tp_price = self.entry_price + 99.0 * atr  # effectively no fixed TP
-                        self._best_price = self.entry_price
-                        self._trailing_active = False
-                    else:
-                        self._tp_price = self.entry_price + self.tp_atr_mult * atr
+                    self._tp_price = self.entry_price + self.tp_atr_mult * atr
             else:
                 invalid_action = True
 
@@ -731,14 +711,9 @@ class GoldTradingEnv(gym.Env):
                     self.entry_step = self.current_step
                     self.balance -= self.commission
 
-                    # Set TP/SL levels (reversed for short)
+                    # Set TP/SL levels (fixed, reversed for short)
                     self._sl_price = self.entry_price + self.sl_atr_mult * atr
-                    if self.exit_mode == "trailing":
-                        self._tp_price = self.entry_price - 99.0 * atr  # effectively no fixed TP
-                        self._best_price = self.entry_price
-                        self._trailing_active = False
-                    else:
-                        self._tp_price = self.entry_price - self.tp_atr_mult * atr
+                    self._tp_price = self.entry_price - self.tp_atr_mult * atr
             else:
                 invalid_action = True
 
@@ -779,17 +754,189 @@ class GoldTradingEnv(gym.Env):
         return self._get_observation(), reward, terminated, truncated, self._get_info()
 
     # ------------------------------------------------------------------
+    # Action Masking (for MaskablePPO)
+    # ------------------------------------------------------------------
+    def action_masks(self) -> np.ndarray:
+        """
+        Hard rule-based entry filter — called by MaskablePPO each step.
+
+        Returns bool array [Hold_ok, Buy_ok, Sell_ok].
+
+        Setup conditions (ALL must be met for entry to be allowed):
+          1. Strong trend: |d_trend_strength| > mask_trend_threshold
+          2. D/S zone nearby: (demand/supply active) AND |ds_distance| < mask_zone_threshold
+          3. Active session: is_active_session = 1  (if mask_require_session=True)
+
+        Direction aligned:
+          - Bullish trend → only Buy allowed
+          - Bearish trend → only Sell allowed
+
+        If already in position → only Hold (no pyramiding)
+        If action masking disabled → all actions valid
+        """
+        if not self.use_action_mask:
+            return np.array([True, True, True], dtype=bool)
+
+        # In position → only hold
+        if self.position != 0:
+            return np.array([True, False, False], dtype=bool)
+
+        step = self.current_step
+
+        # --- Condition 1: Trend (multi-bar confirmation) ---
+        # Use average of last 4 bars to avoid single-bar d_trend flips
+        # This fixes fold 2: gold rallying but 1-bar MACD dip was triggering SHORT
+        trend = 0.0
+        if "d_trend_strength" in self.df.columns:
+            lookback = min(4, step)
+            trend = float(self.df["d_trend_strength"].iloc[max(0, step-lookback):step+1].mean())
+        trend_bullish = trend > self.mask_trend_threshold
+        trend_bearish = trend < -self.mask_trend_threshold
+        if not (trend_bullish or trend_bearish):
+            return np.array([True, False, False], dtype=bool)  # no clear trend
+
+        # Extra: M15 SMA cross check — must agree with daily trend
+        # If M15 SMA20 > SMA50 but daily says bearish → skip (conflicting signal)
+        if "sma_ratio" in self.df.columns:
+            sma_ratio = float(self.df["sma_ratio"].iloc[step])
+            m15_bullish = sma_ratio > 1.0   # M15 SMA20 > SMA50
+            m15_bearish = sma_ratio < 1.0
+            # Block if M15 and daily trend strongly disagree
+            if trend_bullish and m15_bearish and sma_ratio < 0.998:
+                return np.array([True, False, False], dtype=bool)
+            if trend_bearish and m15_bullish and sma_ratio > 1.002:
+                return np.array([True, False, False], dtype=bool)
+
+        # --- Condition 2: D/S zone nearby & aligned ---
+        zone_buy = False
+        zone_sell = False
+        if "demand_active" in self.df.columns:
+            demand = float(self.df["demand_active"].iloc[step])
+            supply = float(self.df["supply_active"].iloc[step])
+            ds_dist = abs(float(self.df["ds_distance"].iloc[step]))
+            near = ds_dist < self.mask_zone_threshold
+            zone_buy = (demand > 0.5) and near
+            zone_sell = (supply > 0.5) and near
+
+        if not (zone_buy or zone_sell):
+            return np.array([True, False, False], dtype=bool)  # no zone
+
+        # --- Condition 3: Active session ---
+        if self.mask_require_session and "is_active_session" in self.df.columns:
+            is_active = float(self.df["is_active_session"].iloc[step]) > 0.5
+            if not is_active:
+                return np.array([True, False, False], dtype=bool)  # quiet session
+
+        # --- Condition 4: Confirmation candle ---
+        # Price must be moving IN the direction of the trade right now
+        # Prevents entering when bar is running the opposite way (59% of bad trades)
+        confirmed = True
+        if "candle_body_ratio" in self.df.columns:
+            body_ratio = float(self.df["candle_body_ratio"].iloc[step])
+            close_val  = float(self.df["close"].iloc[step])
+            open_val   = float(self.df["open"].iloc[step])
+            bullish_bar = (close_val > open_val) and (body_ratio > 0.4)
+            bearish_bar = (close_val < open_val) and (body_ratio > 0.4)
+
+            if trend_bullish and not bullish_bar:
+                confirmed = False   # trying to go long on a bearish/doji bar
+            if trend_bearish and not bearish_bar:
+                confirmed = False   # trying to go short on a bullish/doji bar
+
+        if not confirmed:
+            return np.array([True, False, False], dtype=bool)
+
+        # --- All conditions met: BUY = "trade with trend" (direction-invariant) ---
+        can_buy = (trend_bullish and zone_buy) or (trend_bearish and zone_sell)
+        can_sell = False
+
+        return np.array([True, can_buy, can_sell], dtype=bool)
+
+    # ------------------------------------------------------------------
+    # Direction-Invariant Helpers
+    # ------------------------------------------------------------------
+    def _get_trend_direction(self) -> int:
+        """Returns +1 if bullish, -1 if bearish, 0 if neutral."""
+        if "d_trend_strength" in self.df.columns:
+            t = float(self.df["d_trend_strength"].iloc[self.current_step])
+            if t > self.mask_trend_threshold:
+                return 1
+            if t < -self.mask_trend_threshold:
+                return -1
+        return 0
+
+    def _flip_features_bearish(self, feat_window: np.ndarray) -> np.ndarray:
+        """
+        Flip feature window so bearish market looks identical to bullish.
+        Agent always sees the same 'long setup' pattern — no direction confusion.
+
+        feat_window shape: (window_size, n_features)
+        n_features includes BOTH M15 and daily features (they're merged into each row).
+        """
+        fc = self.feature_columns
+        out = feat_window.copy()
+
+        def idx(name):
+            return fc.index(name) if name in fc else None
+
+        # --- M15 directional features ---
+        for col in ["returns", "macd_diff"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] *= -1
+
+        for col in ["rsi", "bb_position"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] = 1.0 - out[:, i]
+
+        # Swap demand ↔ supply
+        id_d, id_s = idx("demand_active"), idx("supply_active")
+        if id_d is not None and id_s is not None:
+            out[:, id_d], out[:, id_s] = feat_window[:, id_s].copy(), feat_window[:, id_d].copy()
+
+        # Swap fvg_bull ↔ fvg_bear
+        id_fb, id_fs = idx("fvg_bull_active"), idx("fvg_bear_active")
+        if id_fb is not None and id_fs is not None:
+            out[:, id_fb], out[:, id_fs] = feat_window[:, id_fs].copy(), feat_window[:, id_fb].copy()
+
+        # Negate signed distances
+        for col in ["ds_distance", "fvg_distance"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] *= -1
+
+        # --- Daily features (already merged into each row of window) ---
+        for col in ["d_macd_diff", "d_returns_1d", "d_returns_5d", "d_trend_strength"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] *= -1
+
+        for col in ["d_rsi", "d_bb_position"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] = 1.0 - out[:, i]
+
+        return out
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _get_observation(self) -> np.ndarray:
+        trend_dir = self._get_trend_direction()
+
         if self.use_lstm:
-            # LSTM mode: just current step features (LSTM handles memory)
-            features = self._features[self.current_step]
+            features = self._features[self.current_step:self.current_step + 1]  # (1, n_feat)
         else:
-            # MLP mode: flattened window of features
             start = self.current_step - self.window_size
             end = self.current_step
-            features = self._features[start:end].flatten()
+            features = self._features[start:end]  # (window, n_feat)
+
+        # Direction-invariant: flip features for bearish trend
+        if trend_dir == -1:
+            features = self._flip_features_bearish(features)
+
+        features_flat = features.flatten()
 
         if self.position != 0:
             current_price = float(self._closes[self.current_step])
@@ -799,13 +946,15 @@ class GoldTradingEnv(gym.Env):
             unrealized_pnl_pct = 0.0
             duration = 0.0
 
+        # Flip position sign when bearish (agent always sees itself as "long")
+        effective_position = float(self.position) * trend_dir if trend_dir != 0 else float(self.position)
+
         position_info = np.array(
-            [float(self.position), float(unrealized_pnl_pct), float(duration)],
+            [effective_position, float(unrealized_pnl_pct), float(duration)],
             dtype=np.float32,
         )
 
-        obs = np.concatenate([features.astype(np.float32), position_info])
-        # safety: NaN/Inf guard
+        obs = np.concatenate([features_flat.astype(np.float32), position_info])
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _get_info(self) -> dict:

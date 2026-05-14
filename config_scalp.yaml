@@ -1,7 +1,7 @@
 # ============================================================
-#  Gold Trading Bot — Scalping Config (M15)
-#  v6: FVG + D/S zones combined, anti-overtrade entry cost
-#  Best architecture (MLP) + best SL/TP (1.5/4.5 = RR 1:3)
+#  Gold Trading Bot — Action Masked Sniper (M15)
+#  Rule-based filter: only allow entry when trend+zone+session align
+#  Agent learns WHICH valid setups to take, not WHEN to trade
 # ============================================================
 
 data:
@@ -21,13 +21,18 @@ env:
   commission: 0.07
   contract_size: 100.0
   max_position: 1
-  window_size: 20                    # reduced from 30 (fewer dims for more features)
-  reward_type: "scalp_sniper_v6"     # v6: anti-overtrade + FVG + D/S combined
+  window_size: 20
+  reward_type: "masked_sniper"        # clean outcome-based reward
   max_drawdown_pct: 0.5
   trade_cooldown: 0
-  sl_atr_mult: 1.5                   # proven best from walk-forward
-  tp_atr_mult: 4.5                   # RR 1:3 (proven best)
+  sl_atr_mult: 1.5
+  tp_atr_mult: 4.5                    # RR 1:3
   use_lstm: false
+  # Action masking
+  use_action_mask: true               # THE key change
+  mask_trend_threshold: 0.1          # |trend| > 0.1 covers ~60% of bars
+  mask_zone_threshold: 1.5           # ds_distance < 1.5 required
+  mask_require_session: false        # session is reward bonus, not hard requirement
 
 ppo:
   policy: "MlpPolicy"
