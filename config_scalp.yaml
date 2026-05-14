@@ -31,7 +31,7 @@ env:
   # Action masking
   use_action_mask: true               # THE key change
   mask_trend_threshold: 0.1          # |trend| > 0.1 covers ~60% of bars
-  mask_zone_threshold: 1.5           # ds_distance < 1.5 required
+  mask_zone_threshold: 1.5           # ds_distance < 1.5 (proven best)
   mask_require_session: false        # session is reward bonus, not hard requirement
 
 ppo:

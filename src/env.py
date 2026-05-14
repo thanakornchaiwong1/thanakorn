@@ -47,6 +47,12 @@ FEATURE_COLUMNS = [
     "fvg_bear_active",
     "fvg_distance",
     "fvg_strength",
+    # SMC Structure: CHOCH + Swing HH/HL/LH/LL
+    "choch_bullish",      # 1 = bullish CHOCH just occurred (downtrend → uptrend signal)
+    "choch_bearish",      # 1 = bearish CHOCH just occurred (uptrend → downtrend signal)
+    "struct_bullish",     # 1 = currently in bullish structure (HH+HL pattern)
+    "struct_bearish",     # 1 = currently in bearish structure (LH+LL pattern)
+    "dist_to_swing_low",  # distance from close to nearest swing low / ATR
     # Market context
     "is_active_session",
     "candle_body_ratio",
@@ -63,6 +69,117 @@ DAILY_FEATURE_COLUMNS = [
     "d_bb_position",
     "d_trend_strength",   # composite trend score
 ]
+
+
+def _compute_structure_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFrame:
+    """
+    SMC Market Structure: CHOCH + Swing HH/HL/LH/LL detection.
+
+    Based on trader chart analysis:
+      - Track swing highs and lows (local extremes over SWING_WINDOW bars each side)
+      - CHOCH (Change of Character): price breaks ABOVE last swing high after downtrend
+        → signals potential reversal to bullish structure
+      - BOS  (Break of Structure): price breaks ABOVE last swing high in uptrend
+        → confirms bullish structure continues
+      - struct_bullish = 1 when market is making HH + HL pattern
+      - The DEMAND zone that traders use = the HL in bullish structure after CHOCH
+
+    Features:
+      choch_bullish  : 1.0 if bullish CHOCH occurred in last CHOCH_MEMORY candles
+      choch_bearish  : 1.0 if bearish CHOCH occurred in last CHOCH_MEMORY candles
+      struct_bullish : 1.0 if currently in confirmed bullish structure (HH > prev HH)
+      struct_bearish : 1.0 if currently in confirmed bearish structure (LL < prev LL)
+      dist_to_swing_low : signed distance from close to last swing low / ATR
+                          (positive = above swing low = good for long)
+    """
+    SWING_WINDOW = 5     # bars each side to confirm swing high/low
+    CHOCH_MEMORY = 40    # candles a CHOCH signal stays active (~10h on M15)
+
+    n = len(df)
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+    atr    = atr_values.values
+
+    choch_bull  = np.zeros(n, dtype=np.float32)
+    choch_bear  = np.zeros(n, dtype=np.float32)
+    struct_bull = np.zeros(n, dtype=np.float32)
+    struct_bear = np.zeros(n, dtype=np.float32)
+    dist_swl    = np.zeros(n, dtype=np.float32)
+
+    # Rolling swing points
+    swing_highs: list = []  # (bar_idx, price)
+    swing_lows:  list = []
+
+    last_choch_bull_bar = -CHOCH_MEMORY - 1
+    last_choch_bear_bar = -CHOCH_MEMORY - 1
+
+    for i in range(SWING_WINDOW, n - SWING_WINDOW):
+        cur_atr = atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1e-9
+
+        # --- Detect swing high at bar i-SWING_WINDOW (confirmed now) ---
+        pivot = i - SWING_WINDOW
+        if pivot >= SWING_WINDOW:
+            is_sh = all(highs[pivot] >= highs[pivot - k] for k in range(1, SWING_WINDOW + 1)) and \
+                    all(highs[pivot] >= highs[pivot + k] for k in range(1, SWING_WINDOW + 1))
+            is_sl = all(lows[pivot]  <= lows[pivot  - k] for k in range(1, SWING_WINDOW + 1)) and \
+                    all(lows[pivot]  <= lows[pivot  + k] for k in range(1, SWING_WINDOW + 1))
+
+            if is_sh:
+                swing_highs.append((pivot, highs[pivot]))
+                # Keep only last 6 swing highs
+                if len(swing_highs) > 6:
+                    swing_highs.pop(0)
+
+            if is_sl:
+                swing_lows.append((pivot, lows[pivot]))
+                if len(swing_lows) > 6:
+                    swing_lows.pop(0)
+
+        # --- CHOCH detection ---
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+            prev_sh = swing_highs[-2][1]  # 2nd most recent swing high
+            prev_sl = swing_lows[-2][1]
+            last_sh = swing_highs[-1][1]
+            last_sl = swing_lows[-1][1]
+
+            # Bullish CHOCH: close breaks ABOVE the most recent swing high
+            # (while previous structure was making lower highs)
+            if closes[i] > last_sh and last_sh < prev_sh:
+                last_choch_bull_bar = i
+
+            # Bearish CHOCH: close breaks BELOW the most recent swing low
+            if closes[i] < last_sl and last_sl > prev_sl:
+                last_choch_bear_bar = i
+
+        # --- Structure determination ---
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+            # Bullish: most recent swing high > prev swing high AND recent low > prev low
+            if swing_highs[-1][1] > swing_highs[-2][1] and swing_lows[-1][1] > swing_lows[-2][1]:
+                struct_bull[i] = 1.0
+            # Bearish: most recent swing low < prev swing low
+            elif swing_lows[-1][1] < swing_lows[-2][1] and swing_highs[-1][1] < swing_highs[-2][1]:
+                struct_bear[i] = 1.0
+
+        # --- CHOCH memory ---
+        if i - last_choch_bull_bar <= CHOCH_MEMORY:
+            choch_bull[i] = 1.0 - (i - last_choch_bull_bar) / CHOCH_MEMORY  # decays
+        if i - last_choch_bear_bar <= CHOCH_MEMORY:
+            choch_bear[i] = 1.0 - (i - last_choch_bear_bar) / CHOCH_MEMORY
+
+        # --- Distance to nearest swing low ---
+        if swing_lows:
+            nearest_sl = swing_lows[-1][1]
+            raw = closes[i] - nearest_sl
+            dist_swl[i] = np.clip(raw / cur_atr, -3.0, 3.0)
+
+    df["choch_bullish"]     = choch_bull
+    df["choch_bearish"]     = choch_bear
+    df["struct_bullish"]    = struct_bull
+    df["struct_bearish"]    = struct_bear
+    df["dist_to_swing_low"] = dist_swl
+
+    return df
 
 
 def _compute_fvg_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFrame:
@@ -174,81 +291,118 @@ def _compute_fvg_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFra
     return df
 
 
+def _find_base_zone(opens, highs, lows, closes, impulse_idx, direction, atr_val,
+                    max_base_candles=6, min_impulse_atr=1.2):
+    """
+    Find the consolidation BASE before an impulse candle.
+    This matches how traders draw D/S zones: capture the full base width.
+
+    For DEMAND (direction=1, bullish impulse at impulse_idx):
+      - Look back up to max_base_candles before impulse
+      - Base = small candles (body < 0.5 ATR) that consolidate before the rally
+      - Zone = min(lows of base) to max(highs of base)
+
+    For SUPPLY (direction=-1, bearish impulse):
+      - Same but for drops
+    """
+    base_start = impulse_idx - 1
+    base_candles = []
+
+    for j in range(impulse_idx - 1, max(impulse_idx - max_base_candles - 1, -1), -1):
+        if j < 0:
+            break
+        body = abs(closes[j] - opens[j])
+        # A base candle = small body (consolidation, not a strong directional move)
+        if body < 0.6 * atr_val:
+            base_candles.append(j)
+        else:
+            # Stop at any strong opposite candle
+            if direction == 1 and closes[j] < opens[j] and body > 0.8 * atr_val:
+                base_candles.append(j)
+                break
+            elif direction == -1 and closes[j] > opens[j] and body > 0.8 * atr_val:
+                base_candles.append(j)
+                break
+            else:
+                break  # strong same-direction = stop
+
+    if not base_candles:
+        # Fallback: use just the candle immediately before impulse
+        j = impulse_idx - 1
+        if j >= 0:
+            base_candles = [j]
+        else:
+            return None, None
+
+    # Zone = full range of base candles
+    zone_low  = min(lows[j]  for j in base_candles)
+    zone_high = max(highs[j] for j in base_candles)
+
+    # Ensure zone has minimum width (at least 0.1 ATR)
+    if zone_high - zone_low < 0.1 * atr_val:
+        zone_high = zone_low + 0.2 * atr_val
+
+    return zone_low, zone_high
+
+
 def _compute_demand_supply_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFrame:
     """
-    Compute Demand/Supply zone features for the RL agent.
+    Compute Demand/Supply zone features — Base-consolidation method.
 
-    Demand/Supply zones (Smart Money Concepts / Institutional Order Flow):
-      - Demand zone: the last BEARISH candle before a strong BULLISH move
-        (= institutional buy orders were filled here)
-      - Supply zone: the last BULLISH candle before a strong BEARISH move
-        (= institutional sell orders were filled here)
-
-    A "strong move" = candle body > MOVE_THRESHOLD * ATR
+    Based on real trader chart analysis:
+      - Zone = the FULL consolidation base (3-8 candles) before a strong impulse
+        NOT just one candle — traders draw wide zones over the consolidation area
+      - Demand zone: base before strong bullish impulse (DBR pattern)
+      - Supply zone: base before strong bearish impulse (RBD pattern)
+      - Entry signal: when price RETURNS and enters the zone (not just nearby)
 
     Features:
-      - demand_active:  1.0 if there's an active demand zone nearby
-      - supply_active:  1.0 if there's an active supply zone nearby
-      - ds_distance:    signed distance from close to nearest zone / ATR
-      - ds_strength:    strength of the move that created the zone (normalized 0-1)
-      - ds_freshness:   1.0 = untested, decays with each test (fresh zones = stronger)
-
-    Key differences from FVG:
-      - D/S zones represent real institutional order flow, not just wick gaps
-      - D/S zones are LESS frequent = more selective signal
-      - Freshness tracking = zone quality degrades with each touch
-      - Longer max age (50 candles vs 20) = institutional memory persists
+      - demand_active:  1.0 if bullish D/S zone exists
+      - supply_active:  1.0 if bearish D/S zone exists
+      - ds_distance:    signed distance from close to nearest zone edge / ATR
+                        0 = inside zone (= entry zone!), positive = above, negative = below
+      - ds_strength:    impulse move strength (normalized 0-1)
+      - ds_freshness:   1.0 = fresh (first test), decays with retests
     """
-    MOVE_THRESHOLD = 1.0   # strong candle = body > 1.0 * ATR
-    MAX_ZONE_AGE = 50      # zones expire after 50 candles (~12.5h on M15)
-    MAX_TESTS = 3           # zone depleted after 3 touches
+    MOVE_THRESHOLD = 1.2   # impulse = body > 1.2 * ATR (strong move required)
+    MAX_ZONE_AGE   = 80    # M15: 80 candles = 20 hours (zones persist longer)
+    MAX_TESTS      = 2     # fresh = 0 tests, used = 1 test, depleted = 2+
 
     n = len(df)
-    opens = df["open"].values
-    highs = df["high"].values
-    lows = df["low"].values
+    opens  = df["open"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
     closes = df["close"].values
-    atr = atr_values.values
+    atr    = atr_values.values
 
     demand_act = np.zeros(n, dtype=np.float32)
     supply_act = np.zeros(n, dtype=np.float32)
-    ds_dist = np.zeros(n, dtype=np.float32)
-    ds_str = np.zeros(n, dtype=np.float32)
-    ds_fresh = np.zeros(n, dtype=np.float32)
+    ds_dist    = np.zeros(n, dtype=np.float32)
+    ds_str     = np.zeros(n, dtype=np.float32)
+    ds_fresh   = np.zeros(n, dtype=np.float32)
 
     # Active zones: (zone_low, zone_high, direction, birth_idx, test_count, strength)
     active_zones: list = []
 
-    for i in range(2, n):
+    for i in range(5, n):
         cur_atr = atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1e-9
-
-        # --- Detect new zones at candle i ---
-        body = closes[i] - opens[i]  # positive = bullish
+        body = closes[i] - opens[i]
         body_size = abs(body)
 
+        # --- Detect new zone when impulse candle found ---
         if body_size > MOVE_THRESHOLD * cur_atr:
             if body > 0:
-                # Strong bullish candle -> demand zone from preceding bearish candle
-                for j in range(i - 1, max(i - 5, -1), -1):
-                    if j < 0:
-                        break
-                    if closes[j] < opens[j]:  # bearish candle = demand zone base
-                        zone_low = lows[j]
-                        zone_high = max(opens[j], closes[j])
-                        strength = body_size / cur_atr
-                        active_zones.append((zone_low, zone_high, 1, i, 0, strength))
-                        break
+                # Bullish impulse → find base below = DEMAND zone
+                zl, zh = _find_base_zone(opens, highs, lows, closes, i, 1, cur_atr)
+                if zl is not None:
+                    strength = min(body_size / cur_atr / 3.0, 1.0)
+                    active_zones.append((zl, zh, 1, i, 0, strength))
             else:
-                # Strong bearish candle -> supply zone from preceding bullish candle
-                for j in range(i - 1, max(i - 5, -1), -1):
-                    if j < 0:
-                        break
-                    if closes[j] > opens[j]:  # bullish candle = supply zone base
-                        zone_low = min(opens[j], closes[j])
-                        zone_high = highs[j]
-                        strength = body_size / cur_atr
-                        active_zones.append((zone_low, zone_high, -1, i, 0, strength))
-                        break
+                # Bearish impulse → find base above = SUPPLY zone
+                zl, zh = _find_base_zone(opens, highs, lows, closes, i, -1, cur_atr)
+                if zl is not None:
+                    strength = min(body_size / cur_atr / 3.0, 1.0)
+                    active_zones.append((zl, zh, -1, i, 0, strength))
 
         # --- Update zones: expiry, tests, broken ---
         surviving = []
@@ -369,6 +523,9 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
 
     # --- Demand/Supply zone features (institutional order flow) ---
     df = _compute_demand_supply_features(df, atr_values)
+
+    # --- SMC Market Structure: CHOCH + Swing HH/HL/LH/LL ---
+    df = _compute_structure_features(df, atr_values)
 
     # --- Session feature ---
     # Gold sessions: Asian 00-08 UTC (low vol), London 08-13 (breakout),
@@ -783,9 +940,7 @@ class GoldTradingEnv(gym.Env):
 
         step = self.current_step
 
-        # --- Condition 1: Trend (multi-bar confirmation) ---
-        # Use average of last 4 bars to avoid single-bar d_trend flips
-        # This fixes fold 2: gold rallying but 1-bar MACD dip was triggering SHORT
+        # --- Condition 1: Trend (4-bar average — proven best) ---
         trend = 0.0
         if "d_trend_strength" in self.df.columns:
             lookback = min(4, step)
@@ -793,21 +948,19 @@ class GoldTradingEnv(gym.Env):
         trend_bullish = trend > self.mask_trend_threshold
         trend_bearish = trend < -self.mask_trend_threshold
         if not (trend_bullish or trend_bearish):
-            return np.array([True, False, False], dtype=bool)  # no clear trend
+            return np.array([True, False, False], dtype=bool)
 
-        # Extra: M15 SMA cross check — must agree with daily trend
-        # If M15 SMA20 > SMA50 but daily says bearish → skip (conflicting signal)
+        # Extra: M15 SMA cross must agree with daily trend (avoid conflicting signals)
         if "sma_ratio" in self.df.columns:
             sma_ratio = float(self.df["sma_ratio"].iloc[step])
-            m15_bullish = sma_ratio > 1.0   # M15 SMA20 > SMA50
-            m15_bearish = sma_ratio < 1.0
-            # Block if M15 and daily trend strongly disagree
-            if trend_bullish and m15_bearish and sma_ratio < 0.998:
+            if trend_bullish and sma_ratio < 0.998:
                 return np.array([True, False, False], dtype=bool)
-            if trend_bearish and m15_bullish and sma_ratio > 1.002:
+            if trend_bearish and sma_ratio > 1.002:
                 return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 2: D/S zone nearby & aligned ---
+        # --- Condition 2: D/S zone nearby + CHOCH structure confirmation ---
+        # Key insight from trader charts: enter at D/S zone AFTER CHOCH confirms reversal
+        # Without CHOCH, the zone might fail (structure not ready)
         zone_buy = False
         zone_sell = False
         if "demand_active" in self.df.columns:
@@ -815,11 +968,23 @@ class GoldTradingEnv(gym.Env):
             supply = float(self.df["supply_active"].iloc[step])
             ds_dist = abs(float(self.df["ds_distance"].iloc[step]))
             near = ds_dist < self.mask_zone_threshold
-            zone_buy = (demand > 0.5) and near
-            zone_sell = (supply > 0.5) and near
+
+            # CHOCH or bullish structure = trade direction confirmed
+            choch_bull  = float(self.df["choch_bullish"].iloc[step])  if "choch_bullish"  in self.df.columns else 0.0
+            choch_bear  = float(self.df["choch_bearish"].iloc[step])  if "choch_bearish"  in self.df.columns else 0.0
+            struct_bull = float(self.df["struct_bullish"].iloc[step]) if "struct_bullish" in self.df.columns else 1.0
+            struct_bear = float(self.df["struct_bearish"].iloc[step]) if "struct_bearish" in self.df.columns else 1.0
+
+            # Demand zone: need CHOCH bullish OR already in bullish structure
+            bull_confirmed = (choch_bull > 0.0) or (struct_bull > 0.5)
+            # Supply zone: need CHOCH bearish OR already in bearish structure
+            bear_confirmed = (choch_bear > 0.0) or (struct_bear > 0.5)
+
+            zone_buy  = (demand > 0.5) and near and bull_confirmed
+            zone_sell = (supply > 0.5) and near and bear_confirmed
 
         if not (zone_buy or zone_sell):
-            return np.array([True, False, False], dtype=bool)  # no zone
+            return np.array([True, False, False], dtype=bool)  # no confirmed zone
 
         # --- Condition 3: Active session ---
         if self.mask_require_session and "is_active_session" in self.df.columns:
@@ -827,24 +992,18 @@ class GoldTradingEnv(gym.Env):
             if not is_active:
                 return np.array([True, False, False], dtype=bool)  # quiet session
 
-        # --- Condition 4: Confirmation candle ---
-        # Price must be moving IN the direction of the trade right now
-        # Prevents entering when bar is running the opposite way (59% of bad trades)
-        confirmed = True
+        # --- Condition 4: Confirmation candle (body_ratio > 0.4 — proven best) ---
+        # Requires meaningful directional body, not just any close > open
         if "candle_body_ratio" in self.df.columns:
             body_ratio = float(self.df["candle_body_ratio"].iloc[step])
             close_val  = float(self.df["close"].iloc[step])
             open_val   = float(self.df["open"].iloc[step])
             bullish_bar = (close_val > open_val) and (body_ratio > 0.4)
             bearish_bar = (close_val < open_val) and (body_ratio > 0.4)
-
             if trend_bullish and not bullish_bar:
-                confirmed = False   # trying to go long on a bearish/doji bar
+                return np.array([True, False, False], dtype=bool)
             if trend_bearish and not bearish_bar:
-                confirmed = False   # trying to go short on a bullish/doji bar
-
-        if not confirmed:
-            return np.array([True, False, False], dtype=bool)
+                return np.array([True, False, False], dtype=bool)
 
         # --- All conditions met: BUY = "trade with trend" (direction-invariant) ---
         can_buy = (trend_bullish and zone_buy) or (trend_bearish and zone_sell)
