@@ -1220,128 +1220,98 @@ class GoldTradingEnv(gym.Env):
 
         Returns bool array [Hold_ok, Buy_ok, Sell_ok].
 
-        Setup conditions (ALL must be met for entry to be allowed):
-          1. H1 trend (or D1): |h1_trend_strength| > mask_trend_threshold (prefers H1)
-          2. Zone condition (either path):
-               Path A: price INSIDE D/S zone (ds_distance < 0.5) — WR +10.7%
-               Path B: near zone (< mask_zone_threshold) + recent CHOCH — WR +7.0%
-          3. Active session: is_active_session = 1 (if mask_require_session=True)
-          4. Confirmation candle: body_ratio > 0.4 AND directional
+        DESIGN based on corrected oracle test (200k bars, full-data scan, SL=1.5 TP=4.5):
 
-        Direction aligned:
-          - Bullish trend → only Buy allowed
-          - Bearish trend → only Sell allowed
+          Long-only strategy (XAUUSD has bullish bias):
+            Random LONG:                WR 25.9%  (+1.0% vs random)
+            Random SHORT:               WR 23.8%  (-1.1%) ← hurts
+            H1 bull (>0.05) → LONG:    WR 27.4%  (+2.5%) EDGE
+            H1 bull + demand → LONG:   WR 28.3%  (+3.4%) EDGE  ← current mask
+            H1 bull + demand + SMA:     WR 28.5%  (+3.6%) EDGE ← best observed
+            All SHORT strategies:       WR ~24%   (no reliable edge)
 
-        If already in position → only Hold (no pyramiding)
+          Conditions (ALL required):
+            1. H1 bullish trend (h1_trend_strength > mask_trend_threshold = 0.05)
+            2. Demand zone active (demand_active > 0.5)
+            3. Confirmation candle: bullish body (close > open, body_ratio > 0.4)
+            4. LONG only: no SHORT entries (gold's long-term bullish bias)
+
+          Agent observation includes H1 features, SRF, CHOCH, SMA → agent learns
+          WHICH demand zone + H1 trend setups to actually enter (further filtering).
+
+        If already in position → only Hold
         If action masking disabled → all actions valid
         """
         if not self.use_action_mask:
             return np.array([True, True, True], dtype=bool)
 
-        # In position → only hold
+        # In position → only hold (no pyramiding)
         if self.position != 0:
             return np.array([True, False, False], dtype=bool)
 
         step = self.current_step
 
-        # --- Condition 1: Trend (4-bar average — proven best) ---
-        # H1 trend preferred over D1 (more timely for M15 scalping)
-        trend = 0.0
-        trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns else "d_trend_strength"
-        if trend_col in self.df.columns:
-            lookback = min(4, step)
-            trend = float(self.df[trend_col].iloc[max(0, step-lookback):step+1].mean())
-        trend_bullish = trend > self.mask_trend_threshold
-        trend_bearish = trend < -self.mask_trend_threshold
-        if not (trend_bullish or trend_bearish):
+        # --- Condition 1: H1 bullish trend (proven +2.5% WR edge standalone) ---
+        # Only enter in bullish H1 trend — gold's bullish bias amplifies LONG edge
+        trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns \
+                    else "d_trend_strength"
+        if trend_col not in self.df.columns:
             return np.array([True, False, False], dtype=bool)
 
-        # Extra: M15 SMA cross must agree with daily trend (avoid conflicting signals)
-        if "sma_ratio" in self.df.columns:
-            sma_ratio = float(self.df["sma_ratio"].iloc[step])
-            if trend_bullish and sma_ratio < 0.998:
-                return np.array([True, False, False], dtype=bool)
-            if trend_bearish and sma_ratio > 1.002:
-                return np.array([True, False, False], dtype=bool)
-
-        # --- Condition 2: D/S zone — Oracle-proven two-path approach ---
-        #
-        # Oracle test findings (on 200k M15 bars, SL=1.5 TP=4.5):
-        #   - dist < 0.5 (inside zone):           WR 35.6%  (+10.7% vs random)
-        #   - demand + CHOCH (dist < 1.5):         WR 31.9%  (+7.0%)
-        #   - demand alone (dist < 1.5):           WR 26.0%  (+1.1%)  ← too weak
-        #
-        # Two valid paths:
-        #   Path 1: price INSIDE zone (ds_distance < 0.5)  ← strongest edge
-        #   Path 2: near zone (dist < mask_zone_threshold) + recent CHOCH ← +7% combo
-        #
-        zone_buy = False
-        zone_sell = False
-        if "demand_active" in self.df.columns:
-            demand  = float(self.df["demand_active"].iloc[step])
-            supply  = float(self.df["supply_active"].iloc[step])
-            ds_dist = abs(float(self.df["ds_distance"].iloc[step]))
-
-            # Path 1: inside zone
-            inside_demand = (demand > 0.5) and (ds_dist < 0.5)
-            inside_supply = (supply > 0.5) and (ds_dist < 0.5)
-
-            # Path 2: near zone + CHOCH (oracle: demand+choch = +7% WR edge)
-            choch_bull = 0.0
-            choch_bear = 0.0
-            if "choch_bullish" in self.df.columns:
-                choch_bull = float(self.df["choch_bullish"].iloc[step])
-                choch_bear = float(self.df["choch_bearish"].iloc[step])
-
-            near = ds_dist < self.mask_zone_threshold  # wider (1.5) for CHOCH path
-            near_demand_choch = (demand > 0.5) and near and (choch_bull > 0.1)
-            near_supply_choch = (supply > 0.5) and near and (choch_bear > 0.1)
-
-            zone_buy  = inside_demand or near_demand_choch
-            zone_sell = inside_supply or near_supply_choch
-
-        if not (zone_buy or zone_sell):
+        h1_trend = float(self.df[trend_col].iloc[step])
+        if h1_trend <= self.mask_trend_threshold:   # must be bullish (LONG only)
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 3: Active session ---
-        if self.mask_require_session and "is_active_session" in self.df.columns:
-            is_active = float(self.df["is_active_session"].iloc[step]) > 0.5
-            if not is_active:
-                return np.array([True, False, False], dtype=bool)  # quiet session
+        # --- Condition 2: Demand zone active (adds +0.9% to H1 trend edge) ---
+        if "demand_active" not in self.df.columns:
+            return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 4: Confirmation candle (body_ratio > 0.4 — proven best) ---
-        # Requires meaningful directional body, not just any close > open
+        demand = float(self.df["demand_active"].iloc[step])
+        if demand <= 0.5:
+            return np.array([True, False, False], dtype=bool)
+
+        # --- Condition 3: Bullish confirmation candle ---
+        # Proven best: body_ratio > 0.4 AND close > open (bullish candle)
         if "candle_body_ratio" in self.df.columns:
             body_ratio = float(self.df["candle_body_ratio"].iloc[step])
             close_val  = float(self.df["close"].iloc[step])
             open_val   = float(self.df["open"].iloc[step])
-            bullish_bar = (close_val > open_val) and (body_ratio > 0.4)
-            bearish_bar = (close_val < open_val) and (body_ratio > 0.4)
-            if trend_bullish and not bullish_bar:
-                return np.array([True, False, False], dtype=bool)
-            if trend_bearish and not bearish_bar:
+            if not ((close_val > open_val) and (body_ratio > 0.4)):
                 return np.array([True, False, False], dtype=bool)
 
-        # --- All conditions met: BUY = "trade with trend" (direction-invariant) ---
-        can_buy = (trend_bullish and zone_buy) or (trend_bearish and zone_sell)
-        can_sell = False
+        # --- Condition 4: Active session (optional) ---
+        if self.mask_require_session and "is_active_session" in self.df.columns:
+            if float(self.df["is_active_session"].iloc[step]) < 0.5:
+                return np.array([True, False, False], dtype=bool)
 
-        return np.array([True, can_buy, can_sell], dtype=bool)
+        # --- All conditions met: BUY = LONG (H1 bullish, demand zone confirmed) ---
+        # _get_trend_direction() returns +1 → BUY executes as LONG
+        return np.array([True, True, False], dtype=bool)
 
     # ------------------------------------------------------------------
     # Direction-Invariant Helpers
     # ------------------------------------------------------------------
     def _get_trend_direction(self) -> int:
-        """Returns +1 if bullish, -1 if bearish, 0 if neutral.
-        Prefers H1 trend over D1 — more timely for M15 scalping."""
-        trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns else "d_trend_strength"
+        """
+        Returns +1 (bullish = execute BUY as LONG) or -1 (bearish = execute BUY as SHORT).
+
+        LONG-ONLY strategy: H1 trend direction determines execution.
+        - H1 bullish (h1_trend_strength > threshold) → BUY = LONG (+1)
+        - H1 bearish → BUY would remap to SHORT, but mask blocks this (no SHORT entries)
+        - Default: +1 (LONG bias — gold's fundamental bullish nature)
+
+        Direction-invariant still applies: if somehow bearish (legacy), features are flipped.
+        """
+        trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns \
+                    else "d_trend_strength"
         if trend_col in self.df.columns:
             t = float(self.df[trend_col].iloc[self.current_step])
             if t > self.mask_trend_threshold:
-                return 1
+                return 1   # bullish → LONG
             if t < -self.mask_trend_threshold:
-                return -1
-        return 0
+                return -1  # bearish → SHORT (mask blocks this in LONG-ONLY mode)
+        # Default: LONG (gold's bullish bias)
+        return 1
 
     def _flip_features_bearish(self, feat_window: np.ndarray) -> np.ndarray:
         """
