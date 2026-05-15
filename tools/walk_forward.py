@@ -29,10 +29,19 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Force UTF-8 for stdout (Windows Thai cp874 ไม่รองรับ unicode เช่น ±, →)
-# line_buffering=True ensures each print() flushes immediately (critical for background tasks)
-if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+# Windows UTF-8 handling: set PYTHONIOENCODING=utf-8 before running this script.
+# Do NOT replace sys.stdout — it breaks interaction with SB3/tqdm and causes
+# subsequent print() calls after model.learn() to silently not flush.
+#
+# All fold-level print() calls use flush=True explicitly for background task visibility.
+import os
+if sys.platform == "win32" and "PYTHONIOENCODING" not in os.environ:
+    # Best-effort: reconfigure only if not already set via env var
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # Silently skip — PYTHONIOENCODING env var is the recommended way
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
@@ -365,19 +374,17 @@ def main():
         elapsed = (time.time() - t_start) / 60
         eta = elapsed / max(i, 1) * (n_folds - i) if i > 0 else est_total_min
 
-        print(f"\n{'─' * 70}")
+        print(f"\n{'─' * 70}", flush=True)
         print(f" Fold {i+1}/{n_folds} | rows {start_idx}-{start_idx + args.train_size + args.test_size}"
-              f" | elapsed {elapsed:.1f}m | ETA {eta:.0f}m")
-        print(f"{'─' * 70}")
+              f" | elapsed {elapsed:.1f}m | ETA {eta:.0f}m", flush=True)
+        print(f"{'─' * 70}", flush=True)
 
-        print(f" [train] fold {i+1}...")
-        sys.stdout.flush()  # ensure output appears in background task file
+        print(f" [train] fold {i+1}...", flush=True)
         t_fold_start = time.time()
         model, vn, use_lstm, use_mask = train_fold(train_df, cfg, args.timesteps, args.seed + i * 100)
         t_fold_elapsed = time.time() - t_fold_start
 
-        print(f" [test]  fold {i+1}... (train took {t_fold_elapsed/60:.1f}m)")
-        sys.stdout.flush()
+        print(f" [test]  fold {i+1}... (train took {t_fold_elapsed/60:.1f}m)", flush=True)
         m = backtest_fold(test_df, cfg, model, vn, use_lstm=use_lstm, use_mask=use_mask)
         m["fold"] = i + 1
         m["start_row"] = start_idx
@@ -387,8 +394,7 @@ def main():
               f"sharpe={m['sharpe']:5.2f}  "
               f"DD={m['max_dd_pct']:5.2f}%  "
               f"trades={m['total_trades']:4d}  "
-              f"alpha={m['alpha_pct']:+6.2f}%")
-        sys.stdout.flush()
+              f"alpha={m['alpha_pct']:+6.2f}%", flush=True)
 
         del model, vn  # free memory
 
