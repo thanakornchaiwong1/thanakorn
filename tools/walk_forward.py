@@ -175,7 +175,9 @@ def train_fold(train_df, cfg, timesteps, seed):
             device="auto",
         )
 
-    model.learn(total_timesteps=timesteps, progress_bar=True)
+    # progress_bar=False: avoids tqdm/rich patching sys.stdout which breaks line_buffering
+    # Use verbose=1 in SB3 model creation to see training stats instead
+    model.learn(total_timesteps=timesteps, progress_bar=False)
 
     return model, (train_env if use_vn else None), use_lstm, use_mask
 
@@ -369,9 +371,13 @@ def main():
         print(f"{'─' * 70}")
 
         print(f" [train] fold {i+1}...")
+        sys.stdout.flush()  # ensure output appears in background task file
+        t_fold_start = time.time()
         model, vn, use_lstm, use_mask = train_fold(train_df, cfg, args.timesteps, args.seed + i * 100)
+        t_fold_elapsed = time.time() - t_fold_start
 
-        print(f" [test]  fold {i+1}...")
+        print(f" [test]  fold {i+1}... (train took {t_fold_elapsed/60:.1f}m)")
+        sys.stdout.flush()
         m = backtest_fold(test_df, cfg, model, vn, use_lstm=use_lstm, use_mask=use_mask)
         m["fold"] = i + 1
         m["start_row"] = start_idx
@@ -382,6 +388,7 @@ def main():
               f"DD={m['max_dd_pct']:5.2f}%  "
               f"trades={m['total_trades']:4d}  "
               f"alpha={m['alpha_pct']:+6.2f}%")
+        sys.stdout.flush()
 
         del model, vn  # free memory
 
