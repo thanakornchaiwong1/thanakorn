@@ -1385,34 +1385,31 @@ class GoldTradingEnv(gym.Env):
                 can_short = True  # SHORT: momentum breakdown confirmed
 
         # ─────────────────────────────────────────────────────────────────
-        # PATH 2: Supply/Demand Reversal (zone-based, oracle-proven)
+        # PATH 2: Supply Reversal SHORT only (oracle-proven)
         #
         #   SHORT: H1 bear + supply_active + pullback_up + bearish body
-        #     Oracle: WR 28.3% (+4.5%)  — 138 trades
-        #     Rationale: M15 pullback UP into supply zone in a macro downtrend
-        #     "ราคาขึ้นมาชน supply แล้ว reverse ลง" (charts 1,2,4 จากผู้ใช้)
-        #     pullback > 0.3 ATR over 3 bars = price was genuinely rising (not flat)
+        #     Oracle (snapshot): WR 28.3% (+4.5%) — 138 trades
+        #     Oracle (cons60%):  WR 24.2% (+0.4%) — 95 trades
+        #     Using snapshot H1 for this path (consistency hurts supply reversal
+        #     because best entry is at START of bear trend, not after 8h consistent)
+        #     "ราคาขึ้นมาชน supply แล้ว reverse ลง" (trader charts 1,2,4)
         #
-        #   LONG: H1 bull + demand_active + pullback_down + bullish body
-        #     Symmetric to SHORT: price drops to demand in uptrend → reverses up
-        #     "ราคาลงมาชน demand แล้ว reverse ขึ้น" (symmetric entry)
+        #   LONG demand reversal: REMOVED
+        #     Oracle: WR 18.6% (-6.3%) = WORSE than random [BAD]
+        #     Reason: "price drops to demand in uptrend" often breaks through
+        #     demand entirely → trade enters, price continues down → SL hit
+        #     Agent still sees demand_active in observation → learns contextually
         # ─────────────────────────────────────────────────────────────────
         if "m15_pullback" in self.df.columns:
             pullback_val = float(self.df["m15_pullback"].iloc[step])
 
-            # SHORT supply reversal: pullback_val > 0 means price rose recently
-            if (trend_bearish and bearish_bar
-                    and "supply_active" in self.df.columns):
+            # SHORT supply reversal: use snapshot H1 (not consistency — see above)
+            # Check raw h1_trend_strength for this path only
+            if (bearish_bar and "supply_active" in self.df.columns):
+                h1_raw = float(self.df[trend_col].iloc[step])
                 supply_val = float(self.df["supply_active"].iloc[step])
-                if supply_val > 0.5 and pullback_val > 0.3:
+                if h1_raw < -self.mask_trend_threshold and supply_val > 0.5 and pullback_val > 0.3:
                     can_short = True  # SHORT: pullback into supply → reject
-
-            # LONG demand reversal: pullback_val < 0 means price fell recently
-            if (trend_bullish and bullish_bar
-                    and "demand_active" in self.df.columns):
-                demand_val = float(self.df["demand_active"].iloc[step])
-                if demand_val > 0.5 and pullback_val < -0.3:
-                    can_long = True  # LONG: pullback into demand → bounce
 
         if not (can_long or can_short):
             return np.array([True, False, False], dtype=bool)
