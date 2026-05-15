@@ -51,14 +51,14 @@ FEATURE_COLUMNS = [
     # Market context
     "is_active_session",
     "candle_body_ratio",
-    # NOTE: CHOCH/RBR/structure features ARE computed (in DataFrame)
-    # but excluded from observation — adding them consistently hurts performance
-    # (CHOCH 34% active alone = noisy; RBR 2% active = too rare to learn from)
-    # The MASK uses CHOCH as path-2 confirmation (demand+choch = +7% WR edge)
-    #
+    # CHOCH re-added to observation after fixing:
+    # OLD: 5-bar pivot → 34.8% active (too noisy to learn from)
+    # NEW: 20-bar pivot, 8-bar memory → 5.9% active = real events
+    # Oracle v2: LONG+CHOCH=34.6% WR (+9.7%), SHORT+CHOCH=27.4% WR (+2.5%)
+    "choch_bullish",  # decaying score: 1.0=just happened, 0=expired (2h window)
+    "choch_bearish",  # same for bearish CHOCH
     # SRF: oracle test shows +3.7% WR edge → included in observation
-    # so agent can LEARN which SRF setups are worth taking
-    "srf_bull_dist",  # distance to nearest bullish SRF (oracle: +3.7% WR edge)
+    "srf_bull_dist",  # distance to nearest bullish SRF
 ]
 
 DAILY_FEATURE_COLUMNS = [
@@ -110,13 +110,18 @@ def _compute_structure_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.D
       dist_to_swing_low : signed distance from close to last swing low / ATR
                           (positive = above swing low = good for long)
     """
-    SWING_WINDOW = 5     # bars each side to confirm swing high/low
-    CHOCH_MEMORY = 40    # candles a CHOCH signal stays active (~10h on M15)
+    # FIXED: Increased from 5→20 bars = significant swing ~5h on M15 (not micro-pivot)
+    # OLD: 5-bar pivot fired on every tiny swing → CHOCH active 34.8% of bars (noise)
+    # NEW: 20-bar pivot = real structural swing highs/lows humans draw on chart
+    SWING_WINDOW = 20    # bars each side to confirm swing high/low
+    CHOCH_MEMORY = 8     # FIXED: 40→8 bars = 2h active (not 10h "always on")
+    MIN_CHOCH_BODY = 0.6 # ADDED: CHOCH candle must be strong (body > 0.6x ATR)
 
     n = len(df)
     highs  = df["high"].values
     lows   = df["low"].values
     closes = df["close"].values
+    opens  = df["open"].values
     atr    = atr_values.values
 
     choch_bull  = np.zeros(n, dtype=np.float32)
@@ -145,7 +150,6 @@ def _compute_structure_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.D
 
             if is_sh:
                 swing_highs.append((pivot, highs[pivot]))
-                # Keep only last 6 swing highs
                 if len(swing_highs) > 6:
                     swing_highs.pop(0)
 
@@ -154,34 +158,42 @@ def _compute_structure_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.D
                 if len(swing_lows) > 6:
                     swing_lows.pop(0)
 
-        # --- CHOCH detection ---
-        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            prev_sh = swing_highs[-2][1]  # 2nd most recent swing high
+        # --- CHOCH detection + candle quality filter ---
+        # Candle body must be strong to count as a real CHOCH break (not a spike)
+        candle_body = abs(closes[i] - opens[i])
+        strong_candle = candle_body >= MIN_CHOCH_BODY * cur_atr
+
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2 and strong_candle:
+            prev_sh = swing_highs[-2][1]
             prev_sl = swing_lows[-2][1]
             last_sh = swing_highs[-1][1]
             last_sl = swing_lows[-1][1]
 
-            # Bullish CHOCH: close breaks ABOVE the most recent swing high
-            # (while previous structure was making lower highs)
-            if closes[i] > last_sh and last_sh < prev_sh:
+            # Bullish CHOCH: strong candle closes ABOVE last swing high
+            # AND last swing high was lower than previous (= downtrend structure)
+            # AND the break is meaningful (> 0.2 ATR above the swing high)
+            if (closes[i] > last_sh + 0.2 * cur_atr
+                    and last_sh < prev_sh
+                    and closes[i] > opens[i]):  # must be bullish candle
                 last_choch_bull_bar = i
 
-            # Bearish CHOCH: close breaks BELOW the most recent swing low
-            if closes[i] < last_sl and last_sl > prev_sl:
+            # Bearish CHOCH: strong candle closes BELOW last swing low
+            # AND last swing low was higher than previous (= uptrend structure breaking)
+            if (closes[i] < last_sl - 0.2 * cur_atr
+                    and last_sl > prev_sl
+                    and closes[i] < opens[i]):  # must be bearish candle
                 last_choch_bear_bar = i
 
         # --- Structure determination ---
         if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            # Bullish: most recent swing high > prev swing high AND recent low > prev low
             if swing_highs[-1][1] > swing_highs[-2][1] and swing_lows[-1][1] > swing_lows[-2][1]:
                 struct_bull[i] = 1.0
-            # Bearish: most recent swing low < prev swing low
             elif swing_lows[-1][1] < swing_lows[-2][1] and swing_highs[-1][1] < swing_highs[-2][1]:
                 struct_bear[i] = 1.0
 
-        # --- CHOCH memory ---
+        # --- CHOCH memory (decays linearly) ---
         if i - last_choch_bull_bar <= CHOCH_MEMORY:
-            choch_bull[i] = 1.0 - (i - last_choch_bull_bar) / CHOCH_MEMORY  # decays
+            choch_bull[i] = 1.0 - (i - last_choch_bull_bar) / CHOCH_MEMORY
         if i - last_choch_bear_bar <= CHOCH_MEMORY:
             choch_bear[i] = 1.0 - (i - last_choch_bear_bar) / CHOCH_MEMORY
 
@@ -560,9 +572,12 @@ def _compute_demand_supply_features(df: pd.DataFrame, atr_values: pd.Series) -> 
       - ds_strength:    impulse move strength (normalized 0-1)
       - ds_freshness:   1.0 = fresh (first test), decays with retests
     """
-    MOVE_THRESHOLD = 1.2   # impulse = body > 1.2 * ATR (strong move required)
-    MAX_ZONE_AGE   = 80    # M15: 80 candles = 20 hours (zones persist longer)
-    MAX_TESTS      = 2     # fresh = 0 tests, used = 1 test, depleted = 2+
+    # FIXED: 1.2→2.0 ATR = only strong institutional moves create real zones
+    # OLD: body > 1.2 ATR → average candle qualifies → 42% of bars had supply active
+    # NEW: body > 2.0 ATR → only significant impulse moves → zone is meaningful
+    MOVE_THRESHOLD = 2.0   # impulse = body > 2.0 * ATR (strong institutional move)
+    MAX_ZONE_AGE   = 40    # FIXED: 80→40 bars = 10h (zones expire faster, stay fresh)
+    MAX_TESTS      = 1     # FIXED: 2→1 = fresh zone only (first touch is strongest)
 
     n = len(df)
     opens  = df["open"].values
@@ -1220,21 +1235,20 @@ class GoldTradingEnv(gym.Env):
 
         Returns bool array [Hold_ok, Buy_ok, Sell_ok].
 
-        DESIGN based on corrected oracle test (200k bars, full-data scan, SL=1.5 TP=4.5):
+        BIDIRECTIONAL: LONG when H1 bull+demand, SHORT when H1 bear+supply.
+        Same quality conditions applied symmetrically to both directions.
 
-          Long-only strategy (XAUUSD has bullish bias):
-            Random LONG:                WR 25.9%  (+1.0% vs random)
-            Random SHORT:               WR 23.8%  (-1.1%) ← hurts
-            H1 bull (>0.05) → LONG:    WR 27.4%  (+2.5%) EDGE
-            H1 bull + demand → LONG:   WR 28.3%  (+3.4%) EDGE  ← current mask
-            H1 bull + demand + SMA:     WR 28.5%  (+3.6%) EDGE ← best observed
-            All SHORT strategies:       WR ~24%   (no reliable edge)
+        Previous SHORT WR was poor (23.1%) because features were wrong:
+          - supply_active: fired 42% of bars (MOVE_THRESHOLD too low = 1.2 ATR)
+          - CHOCH: fired 34.8% of bars (5-bar micro pivot, 10h memory)
+        Fixed in this version:
+          - supply_active: MOVE_THRESHOLD 1.2→2.0, MAX_TESTS 2→1
+          - CHOCH: SWING_WINDOW 5→20, MEMORY 40→8, + candle quality
 
           Conditions (ALL required):
-            1. H1 bullish trend (h1_trend_strength > mask_trend_threshold = 0.05)
-            2. Demand zone active (demand_active > 0.5)
-            3. Confirmation candle: bullish body (close > open, body_ratio > 0.4)
-            4. LONG only: no SHORT entries (gold's long-term bullish bias)
+            1. H1 trend direction (|h1_trend| > threshold → defines LONG or SHORT)
+            2. Zone aligned with trend (demand for LONG, supply for SHORT)
+            3. Momentum candle in trend direction (body_ratio > 0.4)
 
           Agent observation includes H1 features, SRF, CHOCH, SMA → agent learns
           WHICH demand zone + H1 trend setups to actually enter (further filtering).
@@ -1251,67 +1265,100 @@ class GoldTradingEnv(gym.Env):
 
         step = self.current_step
 
-        # --- Condition 1: H1 bullish trend (proven +2.5% WR edge standalone) ---
-        # Only enter in bullish H1 trend — gold's bullish bias amplifies LONG edge
+        # --- Condition 1: H1 trend direction (defines BUY=LONG or BUY=SHORT) ---
         trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns \
                     else "d_trend_strength"
         if trend_col not in self.df.columns:
             return np.array([True, False, False], dtype=bool)
 
         h1_trend = float(self.df[trend_col].iloc[step])
-        if h1_trend <= self.mask_trend_threshold:   # must be bullish (LONG only)
+        trend_bullish = h1_trend >  self.mask_trend_threshold   # LONG setup
+        trend_bearish = h1_trend < -self.mask_trend_threshold   # SHORT setup
+        if not (trend_bullish or trend_bearish):
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 2: Demand zone active (adds +0.9% to H1 trend edge) ---
-        if "demand_active" not in self.df.columns:
+        # --- Condition 2 + 3: CHOCH + zone/body (oracle-calibrated, no dist filter) ---
+        #
+        # Oracle v2 results (SWING_WINDOW=20, no dist filter):
+        #   LONG: H1 bull + CHOCH bull                  WR=27.9% N=838  +3.0% EDGE
+        #   LONG: H1 bull + CHOCH bull + demand          WR=34.6% N=332  +9.7% EDGE ← best
+        #   SHORT: H1 bear + CHOCH bear                  WR=28.8% N=583  +3.9% EDGE
+        #   SHORT: H1 bear + CHOCH bear + body           WR=29.3% N=379  +4.4% EDGE ← best
+        #   SHORT: H1 bear + CHOCH bear + supply         WR=27.4% N=223  +2.5% (supply hurts N)
+        #
+        # Key insight:
+        #   LONG benefits from demand zone context (confirms institutional support)
+        #   SHORT benefits from body confirmation (confirms bearish momentum)
+        #   dist threshold NOT used — price is often far from zone when trend/CHOCH fires
+        #
+        if "choch_bullish" not in self.df.columns:
             return np.array([True, False, False], dtype=bool)
 
-        demand = float(self.df["demand_active"].iloc[step])
-        if demand <= 0.5:
+        choch_bull = float(self.df["choch_bullish"].iloc[step])
+        choch_bear = float(self.df["choch_bearish"].iloc[step])
+
+        # CHOCH is the primary signal for both directions
+        can_long_base  = trend_bullish and (choch_bull > 0.1)   # LONG base
+        can_short_base = trend_bearish and (choch_bear > 0.1)   # SHORT base
+
+        if not (can_long_base or can_short_base):
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 3: Bullish confirmation candle ---
-        # Proven best: body_ratio > 0.4 AND close > open (bullish candle)
+        # Body confirmation (momentum candle aligned with direction)
+        # Oracle: body filter helps both LONG (28.3%) and SHORT (29.3%)
+        # Demand/supply zone stays in OBSERVATION — agent learns when it adds value
+        #   LONG oracle:  H1+CHOCH+body=28.3%, H1+CHOCH+demand+body=34.2%
+        #                 → agent learns "take CHOCH when demand is active" from obs
+        #   SHORT oracle: H1+CHOCH+body=29.3%
         if "candle_body_ratio" in self.df.columns:
             body_ratio = float(self.df["candle_body_ratio"].iloc[step])
             close_val  = float(self.df["close"].iloc[step])
             open_val   = float(self.df["open"].iloc[step])
-            if not ((close_val > open_val) and (body_ratio > 0.4)):
-                return np.array([True, False, False], dtype=bool)
+            bullish_bar = (close_val > open_val) and (body_ratio > 0.4)
+            bearish_bar = (close_val < open_val) and (body_ratio > 0.4)
+
+            can_long  = can_long_base  and bullish_bar
+            can_short = can_short_base and bearish_bar
+        else:
+            can_long  = can_long_base
+            can_short = can_short_base
+
+        if not (can_long or can_short):
+            return np.array([True, False, False], dtype=bool)
 
         # --- Condition 4: Active session (optional) ---
         if self.mask_require_session and "is_active_session" in self.df.columns:
             if float(self.df["is_active_session"].iloc[step]) < 0.5:
                 return np.array([True, False, False], dtype=bool)
 
-        # --- All conditions met: BUY = LONG (H1 bullish, demand zone confirmed) ---
-        # _get_trend_direction() returns +1 → BUY executes as LONG
-        return np.array([True, True, False], dtype=bool)
+        # --- All conditions met ---
+        # BUY = direction-invariant entry:
+        #   can_long  → _get_trend_direction()=+1 → BUY stays BUY → LONG
+        #   can_short → _get_trend_direction()=-1 → BUY remapped to SELL → SHORT
+        can_buy = can_long or can_short  # type: ignore[possibly-undefined]
+        return np.array([True, can_buy, False], dtype=bool)
 
     # ------------------------------------------------------------------
     # Direction-Invariant Helpers
     # ------------------------------------------------------------------
     def _get_trend_direction(self) -> int:
         """
-        Returns +1 (bullish = execute BUY as LONG) or -1 (bearish = execute BUY as SHORT).
+        Returns +1 (execute BUY as LONG) or -1 (execute BUY as SHORT).
 
-        LONG-ONLY strategy: H1 trend direction determines execution.
-        - H1 bullish (h1_trend_strength > threshold) → BUY = LONG (+1)
-        - H1 bearish → BUY would remap to SHORT, but mask blocks this (no SHORT entries)
-        - Default: +1 (LONG bias — gold's fundamental bullish nature)
-
-        Direction-invariant still applies: if somehow bearish (legacy), features are flipped.
+        BIDIRECTIONAL: H1 trend determines direction for BOTH LONG and SHORT.
+        - H1 bullish (> threshold) → BUY = LONG  → observation NOT flipped
+        - H1 bearish (< -threshold) → BUY remapped to SELL = SHORT → observation FLIPPED
+        - Direction-invariant: agent always 'sees' a bullish setup regardless of direction
         """
         trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns \
                     else "d_trend_strength"
         if trend_col in self.df.columns:
             t = float(self.df[trend_col].iloc[self.current_step])
             if t > self.mask_trend_threshold:
-                return 1   # bullish → LONG
+                return 1   # H1 bullish → LONG
             if t < -self.mask_trend_threshold:
-                return -1  # bearish → SHORT (mask blocks this in LONG-ONLY mode)
-        # Default: LONG (gold's bullish bias)
-        return 1
+                return -1  # H1 bearish → SHORT
+        return 0  # no clear trend → hold (mask blocks entry)
 
     def _flip_features_bearish(self, feat_window: np.ndarray) -> np.ndarray:
         """
