@@ -81,19 +81,24 @@ DAILY_FEATURE_COLUMNS = [
     "d_trend_strength",   # composite trend score
 ]
 
-# H1 features (resampled from M15) — 9 features same count as daily
+# H1 features (resampled from M15) — 11 features
 # H1 gives timelier trend signal than D1 for M15 scalping
 # "D1 มันใหญ่เกินไป สำหรับ M15" — user feedback
 H1_FEATURE_COLUMNS = [
     "h1_rsi",
     "h1_macd_diff",
     "h1_returns_1h",
-    "h1_returns_4h",      # 4H momentum (4 x H1 bars)
-    "h1_sma_20_ratio",    # 20 H1 bars ≈ 1 day
-    "h1_sma_50_ratio",    # 50 H1 bars ≈ 2 days
+    "h1_returns_4h",         # 4H momentum (4 x H1 bars)
+    "h1_sma_20_ratio",       # 20 H1 bars ≈ 1 day
+    "h1_sma_50_ratio",       # 50 H1 bars ≈ 2 days
     "h1_atr_ratio",
     "h1_bb_position",
-    "h1_trend_strength",  # composite: sma_align + macd (key mask feature)
+    "h1_trend_strength",     # composite: sma_align + macd (key mask feature)
+    # Consistency features (rolling 8 H1 bars = 8h window)
+    # Diagnosis: bad folds have H1 neutral 72-80% → CHOCH fires on noise
+    # Fix: require 60%+ of last 8 H1 bars in same direction = real trend
+    "h1_bull_consistency",   # fraction of last 8 H1 bars that are bullish (>0.05)
+    "h1_bear_consistency",   # fraction of last 8 H1 bars that are bearish (<-0.05)
 ]
 
 
@@ -940,6 +945,28 @@ def compute_h1_features(df_m15: pd.DataFrame) -> pd.DataFrame:
     macd_norm  = df_h1["h1_macd_diff"]
     df_h1["h1_trend_strength"] = (sma_align * 10 + macd_norm * 25).clip(-1.0, 1.0)
 
+    # ── H1 Trend Consistency (rolling 8 H1 bars = 8h window) ──────────────
+    # Root cause fix: bad folds have H1 neutral 72-80% → CHOCH fires on noise
+    #   Fold3 (WR=10%): H1 bull only 10.1% → can't get 60% consecutive
+    #   Fold7 (WR=39%): H1 bull 23.3% → extended bull periods → 60% easy
+    # Using mask_trend_threshold=0.05 (default, matches config)
+    _CONS_THRESHOLD = 0.05
+    _CONS_WINDOW    = 8     # 8 H1 bars = 8 hours
+    df_h1["h1_bull_consistency"] = (
+        (df_h1["h1_trend_strength"] > _CONS_THRESHOLD)
+        .rolling(_CONS_WINDOW, min_periods=4)
+        .mean()
+        .fillna(0.0)
+        .astype(np.float32)
+    )
+    df_h1["h1_bear_consistency"] = (
+        (df_h1["h1_trend_strength"] < -_CONS_THRESHOLD)
+        .rolling(_CONS_WINDOW, min_periods=4)
+        .mean()
+        .fillna(0.0)
+        .astype(np.float32)
+    )
+
     return df_h1[H1_FEATURE_COLUMNS].dropna()
 
 
@@ -1301,15 +1328,29 @@ class GoldTradingEnv(gym.Env):
 
         step = self.current_step
 
-        # --- Condition 1: H1 trend direction (defines BUY=LONG or BUY=SHORT) ---
+        # --- Condition 1: H1 trend direction — CONSISTENCY check (not snapshot) ---
+        # FIX: snapshot (single bar) caused trading in sideways H1
+        #   Bad folds: H1 neutral 72-80% → brief bull spikes → false CHOCH signal
+        #   Fix: require 60%+ of last 8 H1 bars (8h) in same direction
+        #   Bad fold H1 bull 10% → can't sustain 60% → blocked
+        #   Good fold H1 bull 23% → extended bull runs → passes easily
         trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns \
                     else "d_trend_strength"
         if trend_col not in self.df.columns:
             return np.array([True, False, False], dtype=bool)
 
-        h1_trend = float(self.df[trend_col].iloc[step])
-        trend_bullish = h1_trend >  self.mask_trend_threshold   # LONG setup
-        trend_bearish = h1_trend < -self.mask_trend_threshold   # SHORT setup
+        if "h1_bull_consistency" in self.df.columns:
+            # Precomputed rolling 8-H1-bar consistency (fast O(1) lookup)
+            bull_cons = float(self.df["h1_bull_consistency"].iloc[step])
+            bear_cons = float(self.df["h1_bear_consistency"].iloc[step])
+            trend_bullish = bull_cons >= 0.60   # 6/8 H1 bars = real bull trend
+            trend_bearish = bear_cons >= 0.60   # 6/8 H1 bars = real bear trend
+        else:
+            # Fallback: snapshot (old behaviour)
+            h1_trend = float(self.df[trend_col].iloc[step])
+            trend_bullish = h1_trend >  self.mask_trend_threshold
+            trend_bearish = h1_trend < -self.mask_trend_threshold
+
         if not (trend_bullish or trend_bearish):
             return np.array([True, False, False], dtype=bool)
 
