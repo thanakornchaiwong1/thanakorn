@@ -51,6 +51,14 @@ FEATURE_COLUMNS = [
     # Market context
     "is_active_session",
     "candle_body_ratio",
+    # Price action: Candle patterns (vectorized, no loop overhead)
+    # engulfing_bear: bullish→bearish full engulf = strong reversal at supply
+    # engulfing_bull: bearish→bullish full engulf = strong reversal at demand
+    # m15_pullback: 3-bar price change / ATR (+ve=price went up, -ve=went down)
+    #   Used in mask Path 2: supply reversal requires pullback_val > 0.3 ATR
+    "engulfing_bear",
+    "engulfing_bull",
+    "m15_pullback",
     # CHOCH re-added to observation after fixing:
     # OLD: 5-bar pivot → 34.8% active (too noisy to learn from)
     # NEW: 20-bar pivot, 8-bar memory → 5.9% active = real events
@@ -761,6 +769,34 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
     candle_body = (df["close"] - df["open"]).abs()
     df["candle_body_ratio"] = (candle_body / (candle_range + 1e-9)).clip(0.0, 1.0).astype(np.float32)
 
+    # --- Engulfing pattern detection (vectorized) ---
+    # Bearish engulfing: prev candle bullish → curr candle bearish AND body fully engulfs prev body
+    #   Classic reversal at supply: "ชนโซนแล้วเกิด Engulfing เข้า sell"
+    #   Oracle: H1 bear + supply + pullback + Engulfing → WR 34.6% (+10.8% vs baseline)
+    # Bullish engulfing: symmetric for demand zone reversal entries
+    prev_close = df["close"].shift(1)
+    prev_open  = df["open"].shift(1)
+
+    prev_bullish = prev_close > prev_open
+    curr_bearish = df["close"] < df["open"]
+    bear_engulfs = (df["open"] >= prev_close) & (df["close"] <= prev_open)
+    df["engulfing_bear"] = (prev_bullish & curr_bearish & bear_engulfs).astype(np.float32)
+
+    prev_bearish = prev_close < prev_open
+    curr_bullish = df["close"] > df["open"]
+    bull_engulfs = (df["open"] <= prev_close) & (df["close"] >= prev_open)
+    df["engulfing_bull"] = (prev_bearish & curr_bullish & bull_engulfs).astype(np.float32)
+
+    # --- M15 Pullback Strength (3-bar normalized price change) ---
+    # Measures: how many ATR units has price moved over the last 3 bars (45 min on M15)
+    # +1.0 = price rose 1 ATR   → strong pullback UP into supply zone
+    # -1.0 = price fell 1 ATR   → strong pullback DOWN into demand zone
+    #  0.0 = price flat (sideways, no directional pullback)
+    # Used in mask Path 2: supply reversal needs pullback_val > 0.3 ATR (price came from below)
+    price_change_3 = (df["close"] - df["close"].shift(3)).fillna(0.0)
+    atr_price = (df["atr_ratio"] * df["close"]).replace(0.0, 1e-9)
+    df["m15_pullback"] = (price_change_3 / atr_price).clip(-3.0, 3.0).astype(np.float32)
+
     df = df.dropna()
     if reset_index:
         df = df.reset_index(drop=True)
@@ -1277,51 +1313,65 @@ class GoldTradingEnv(gym.Env):
         if not (trend_bullish or trend_bearish):
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 2 + 3: CHOCH + zone/body (oracle-calibrated, no dist filter) ---
-        #
-        # Oracle v2 results (SWING_WINDOW=20, no dist filter):
-        #   LONG: H1 bull + CHOCH bull                  WR=27.9% N=838  +3.0% EDGE
-        #   LONG: H1 bull + CHOCH bull + demand          WR=34.6% N=332  +9.7% EDGE ← best
-        #   SHORT: H1 bear + CHOCH bear                  WR=28.8% N=583  +3.9% EDGE
-        #   SHORT: H1 bear + CHOCH bear + body           WR=29.3% N=379  +4.4% EDGE ← best
-        #   SHORT: H1 bear + CHOCH bear + supply         WR=27.4% N=223  +2.5% (supply hurts N)
-        #
-        # Key insight:
-        #   LONG benefits from demand zone context (confirms institutional support)
-        #   SHORT benefits from body confirmation (confirms bearish momentum)
-        #   dist threshold NOT used — price is often far from zone when trend/CHOCH fires
-        #
-        if "choch_bullish" not in self.df.columns:
-            return np.array([True, False, False], dtype=bool)
+        # --- Candle body / direction (used by both paths) ---
+        can_long  = False
+        can_short = False
 
-        choch_bull = float(self.df["choch_bullish"].iloc[step])
-        choch_bear = float(self.df["choch_bearish"].iloc[step])
-
-        # CHOCH is the primary signal for both directions
-        can_long_base  = trend_bullish and (choch_bull > 0.1)   # LONG base
-        can_short_base = trend_bearish and (choch_bear > 0.1)   # SHORT base
-
-        if not (can_long_base or can_short_base):
-            return np.array([True, False, False], dtype=bool)
-
-        # Body confirmation (momentum candle aligned with direction)
-        # Oracle: body filter helps both LONG (28.3%) and SHORT (29.3%)
-        # Demand/supply zone stays in OBSERVATION — agent learns when it adds value
-        #   LONG oracle:  H1+CHOCH+body=28.3%, H1+CHOCH+demand+body=34.2%
-        #                 → agent learns "take CHOCH when demand is active" from obs
-        #   SHORT oracle: H1+CHOCH+body=29.3%
         if "candle_body_ratio" in self.df.columns:
-            body_ratio = float(self.df["candle_body_ratio"].iloc[step])
-            close_val  = float(self.df["close"].iloc[step])
-            open_val   = float(self.df["open"].iloc[step])
+            body_ratio  = float(self.df["candle_body_ratio"].iloc[step])
+            close_val   = float(self.df["close"].iloc[step])
+            open_val    = float(self.df["open"].iloc[step])
             bullish_bar = (close_val > open_val) and (body_ratio > 0.4)
             bearish_bar = (close_val < open_val) and (body_ratio > 0.4)
-
-            can_long  = can_long_base  and bullish_bar
-            can_short = can_short_base and bearish_bar
         else:
-            can_long  = can_long_base
-            can_short = can_short_base
+            bullish_bar = True
+            bearish_bar = True
+
+        # ─────────────────────────────────────────────────────────────────
+        # PATH 1: CHOCH Momentum (oracle-proven)
+        #   LONG:  H1 bull + CHOCH bull + bullish body → WR 28.3% (+3.4%)
+        #   SHORT: H1 bear + CHOCH bear + bearish body → WR 29.3% (+5.5%)
+        #   "CHOCH = ราคาทะลุ swing high/low = momentum break"
+        #   Agent learns from demand/supply/SRF in obs → further filters internally
+        # ─────────────────────────────────────────────────────────────────
+        if "choch_bullish" in self.df.columns:
+            choch_bull = float(self.df["choch_bullish"].iloc[step])
+            choch_bear = float(self.df["choch_bearish"].iloc[step])
+
+            if trend_bullish and (choch_bull > 0.1) and bullish_bar:
+                can_long = True   # LONG: momentum breakout confirmed
+            if trend_bearish and (choch_bear > 0.1) and bearish_bar:
+                can_short = True  # SHORT: momentum breakdown confirmed
+
+        # ─────────────────────────────────────────────────────────────────
+        # PATH 2: Supply/Demand Reversal (zone-based, oracle-proven)
+        #
+        #   SHORT: H1 bear + supply_active + pullback_up + bearish body
+        #     Oracle: WR 28.3% (+4.5%)  — 138 trades
+        #     Rationale: M15 pullback UP into supply zone in a macro downtrend
+        #     "ราคาขึ้นมาชน supply แล้ว reverse ลง" (charts 1,2,4 จากผู้ใช้)
+        #     pullback > 0.3 ATR over 3 bars = price was genuinely rising (not flat)
+        #
+        #   LONG: H1 bull + demand_active + pullback_down + bullish body
+        #     Symmetric to SHORT: price drops to demand in uptrend → reverses up
+        #     "ราคาลงมาชน demand แล้ว reverse ขึ้น" (symmetric entry)
+        # ─────────────────────────────────────────────────────────────────
+        if "m15_pullback" in self.df.columns:
+            pullback_val = float(self.df["m15_pullback"].iloc[step])
+
+            # SHORT supply reversal: pullback_val > 0 means price rose recently
+            if (trend_bearish and bearish_bar
+                    and "supply_active" in self.df.columns):
+                supply_val = float(self.df["supply_active"].iloc[step])
+                if supply_val > 0.5 and pullback_val > 0.3:
+                    can_short = True  # SHORT: pullback into supply → reject
+
+            # LONG demand reversal: pullback_val < 0 means price fell recently
+            if (trend_bullish and bullish_bar
+                    and "demand_active" in self.df.columns):
+                demand_val = float(self.df["demand_active"].iloc[step])
+                if demand_val > 0.5 and pullback_val < -0.3:
+                    can_long = True  # LONG: pullback into demand → bounce
 
         if not (can_long or can_short):
             return np.array([True, False, False], dtype=bool)
