@@ -30,32 +30,31 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 FEATURE_COLUMNS = [
+    # Technical momentum/trend
     "returns",
     "rsi",
     "sma_ratio",
     "macd_diff",
     "bb_position",
     "atr_ratio",
-    # Price action: Demand/Supply zones (institutional order flow)
+    # Price action: Demand/Supply zones (base-consolidation detection)
     "demand_active",
     "supply_active",
     "ds_distance",
     "ds_strength",
     "ds_freshness",
-    # Price action: Fair Value Gap (kept — v2 proved it helps as context)
+    # Price action: Fair Value Gap
     "fvg_bull_active",
     "fvg_bear_active",
     "fvg_distance",
     "fvg_strength",
-    # SMC Structure: CHOCH + Swing HH/HL/LH/LL
-    "choch_bullish",      # 1 = bullish CHOCH just occurred (downtrend → uptrend signal)
-    "choch_bearish",      # 1 = bearish CHOCH just occurred (uptrend → downtrend signal)
-    "struct_bullish",     # 1 = currently in bullish structure (HH+HL pattern)
-    "struct_bearish",     # 1 = currently in bearish structure (LH+LL pattern)
-    "dist_to_swing_low",  # distance from close to nearest swing low / ATR
     # Market context
     "is_active_session",
     "candle_body_ratio",
+    # NOTE: CHOCH/RBR/SRF/structure features ARE computed (in DataFrame)
+    # but excluded from observation — adding them consistently hurts performance
+    # (CHOCH 55% active = noisy; RBR 2% active = too rare to learn from)
+    # The MASK already handles quality filtering via trend+zone+candle confirmation
 ]
 
 DAILY_FEATURE_COLUMNS = [
@@ -178,6 +177,184 @@ def _compute_structure_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.D
     df["struct_bullish"]    = struct_bull
     df["struct_bearish"]    = struct_bear
     df["dist_to_swing_low"] = dist_swl
+
+    return df
+
+
+def _compute_rbr_srf_features(df: pd.DataFrame, atr_values: pd.Series) -> pd.DataFrame:
+    """
+    RBR (Rally-Base-Rally) / DBD (Drop-Base-Drop) and SRF (Support-Resistance Flip).
+
+    RBR Demand zone (from trader charts):
+      Rally (strong bullish move) → Base (tight consolidation) → Rally again
+      The BASE is the demand zone — strongest type of demand
+      "พอปิดแท่งราคาย้อนมาเข้า BUY เลย" = entry when price returns to base
+
+    DBD Supply zone:
+      Drop → Base → Drop = supply zone at the base
+
+    SRF (Support-Resistance Flip):
+      Former support level that gets broken → becomes resistance
+      Former resistance that gets broken → becomes support
+      "แนวรับเปลี่ยนเป็นแนวต้าน" = when price returns to broken support = SHORT
+
+    Features:
+      rbr_active    : 1.0 if there's an active RBR demand zone
+      dbd_active    : 1.0 if there's an active DBD supply zone
+      rbr_distance  : signed distance from close to nearest RBR zone / ATR
+      srf_bull_dist : distance to nearest bullish SRF (former resistance now support)
+      srf_bear_dist : distance to nearest bearish SRF (former support now resistance)
+    """
+    STRONG_MOVE = 1.0   # rally/drop = body > 1.0 * ATR
+    BASE_CANDLES = 5    # max base width (candles)
+    BASE_RANGE   = 0.5  # base height < 0.5 ATR (tight consolidation)
+    MAX_AGE      = 80   # zone valid for 80 candles
+    SWING_LOOKBACK = 10 # bars to find swing high/low for SRF
+
+    n = len(df)
+    opens  = df["open"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+    atr    = atr_values.values
+
+    rbr_act    = np.zeros(n, dtype=np.float32)
+    dbd_act    = np.zeros(n, dtype=np.float32)
+    rbr_dist   = np.zeros(n, dtype=np.float32)
+    srf_b_dist = np.zeros(n, dtype=np.float32)
+    srf_s_dist = np.zeros(n, dtype=np.float32)
+
+    active_rbr: list = []  # (zl, zh, birth_idx)
+    active_dbd: list = []
+    active_srf_bull: list = []  # former resistance now support
+    active_srf_bear: list = []  # former support now resistance
+
+    # Track recent swing highs/lows for SRF
+    recent_swing_highs: list = []
+    recent_swing_lows:  list = []
+
+    for i in range(max(BASE_CANDLES + 2, SWING_LOOKBACK), n):
+        cur_atr = atr[i] if not np.isnan(atr[i]) and atr[i] > 0 else 1e-9
+
+        # ─── Detect swing levels for SRF ───────────────────────────────
+        piv = i - SWING_LOOKBACK // 2
+        if piv >= SWING_LOOKBACK:
+            half = SWING_LOOKBACK // 2
+            is_sh = highs[piv] == max(highs[piv-half:piv+half+1])
+            is_sl = lows[piv]  == min(lows[piv-half:piv+half+1])
+            if is_sh:
+                recent_swing_highs.append((piv, highs[piv]))
+                if len(recent_swing_highs) > 8:
+                    recent_swing_highs.pop(0)
+            if is_sl:
+                recent_swing_lows.append((piv, lows[piv]))
+                if len(recent_swing_lows) > 8:
+                    recent_swing_lows.pop(0)
+
+        # ─── Detect SRF: broken support becomes resistance ──────────────
+        # Bearish SRF: price closes below an old swing low (breaks support)
+        if recent_swing_lows:
+            for idx, (sl_bar, sl_price) in enumerate(recent_swing_lows):
+                if closes[i] < sl_price and i - sl_bar > 3:
+                    # Support broken → sl_price becomes resistance (bearish SRF)
+                    active_srf_bear.append((sl_price - 0.5*cur_atr, sl_price + 0.3*cur_atr, i))
+                    recent_swing_lows.pop(idx)
+                    break
+        # Bullish SRF: price closes above an old swing high (breaks resistance)
+        if recent_swing_highs:
+            for idx, (sh_bar, sh_price) in enumerate(recent_swing_highs):
+                if closes[i] > sh_price and i - sh_bar > 3:
+                    active_srf_bull.append((sh_price - 0.3*cur_atr, sh_price + 0.5*cur_atr, i))
+                    recent_swing_highs.pop(idx)
+                    break
+
+        # ─── Detect RBR: Rally → Base → Rally ──────────────────────────
+        body_i = closes[i] - opens[i]
+        if body_i > STRONG_MOVE * cur_atr:  # Current strong bullish candle
+            # Look back for base (tight range candles) before this rally
+            # Then check there was a rally BEFORE the base too
+            base_end = i - 1
+            base_candles_idx = []
+            for j in range(base_end, max(i - BASE_CANDLES - 1, 0), -1):
+                range_j = highs[j] - lows[j]
+                body_j = abs(closes[j] - opens[j])
+                if range_j < BASE_RANGE * cur_atr:  # tight candle = base
+                    base_candles_idx.append(j)
+                else:
+                    break
+
+            if len(base_candles_idx) >= 1:
+                # Check there was a rally before the base
+                pre_base = base_candles_idx[-1] - 1
+                if pre_base >= 0:
+                    pre_body = closes[pre_base] - opens[pre_base]
+                    if pre_body > 0.5 * cur_atr:  # bullish before base = RBR!
+                        zl = min(lows[j] for j in base_candles_idx)
+                        zh = max(highs[j] for j in base_candles_idx)
+                        if zh - zl < 1.5 * cur_atr:  # tight zone only
+                            active_rbr.append((zl, zh, i))
+
+        # Detect DBD: Drop → Base → Drop
+        if -body_i > STRONG_MOVE * cur_atr:
+            base_candles_idx = []
+            for j in range(i-1, max(i-BASE_CANDLES-1, 0), -1):
+                range_j = highs[j] - lows[j]
+                if range_j < BASE_RANGE * cur_atr:
+                    base_candles_idx.append(j)
+                else:
+                    break
+            if len(base_candles_idx) >= 1:
+                pre_base = base_candles_idx[-1] - 1
+                if pre_base >= 0:
+                    pre_body = opens[pre_base] - closes[pre_base]
+                    if pre_body > 0.5 * cur_atr:
+                        zl = min(lows[j] for j in base_candles_idx)
+                        zh = max(highs[j] for j in base_candles_idx)
+                        if zh - zl < 1.5 * cur_atr:
+                            active_dbd.append((zl, zh, i))
+
+        # ─── Update zones (expire + fill check) ────────────────────────
+        def update_zones(zones):
+            surviving = []
+            for zl, zh, birth in zones:
+                if i - birth > MAX_AGE:
+                    continue
+                if zl <= closes[i] <= zh:  # filled
+                    continue
+                surviving.append((zl, zh, birth))
+            return surviving
+
+        active_rbr = update_zones(active_rbr)
+        active_dbd = update_zones(active_dbd)
+        active_srf_bear = [(zl, zh, b) for zl, zh, b in active_srf_bear if i-b <= MAX_AGE]
+        active_srf_bull = [(zl, zh, b) for zl, zh, b in active_srf_bull if i-b <= MAX_AGE]
+
+        # ─── Compute features ──────────────────────────────────────────
+        if active_rbr:
+            rbr_act[i] = 1.0
+            nearest = min(active_rbr, key=lambda z: abs(closes[i] - (z[0]+z[1])/2))
+            zl, zh, _ = nearest
+            raw = closes[i] - zh if closes[i] > zh else (closes[i] - zl if closes[i] < zl else 0.0)
+            rbr_dist[i] = np.clip(raw / cur_atr, -3.0, 3.0)
+
+        if active_dbd:
+            dbd_act[i] = 1.0
+
+        # SRF distances (signed: near = agent should trade)
+        if active_srf_bull:
+            nearest_b = min(active_srf_bull, key=lambda z: abs(closes[i] - (z[0]+z[1])/2))
+            raw = closes[i] - nearest_b[1] if closes[i] > nearest_b[1] else (closes[i] - nearest_b[0] if closes[i] < nearest_b[0] else 0.0)
+            srf_b_dist[i] = np.clip(raw / cur_atr, -3.0, 3.0)
+        if active_srf_bear:
+            nearest_s = min(active_srf_bear, key=lambda z: abs(closes[i] - (z[0]+z[1])/2))
+            raw = closes[i] - nearest_s[1] if closes[i] > nearest_s[1] else (closes[i] - nearest_s[0] if closes[i] < nearest_s[0] else 0.0)
+            srf_s_dist[i] = np.clip(raw / cur_atr, -3.0, 3.0)
+
+    df["rbr_active"]    = rbr_act
+    df["dbd_active"]    = dbd_act
+    df["rbr_distance"]  = rbr_dist
+    df["srf_bull_dist"] = srf_b_dist
+    df["srf_bear_dist"] = srf_s_dist
 
     return df
 
@@ -526,6 +703,9 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
 
     # --- SMC Market Structure: CHOCH + Swing HH/HL/LH/LL ---
     df = _compute_structure_features(df, atr_values)
+
+    # --- RBR/DBD zones + SRF (Support-Resistance Flip) ---
+    df = _compute_rbr_srf_features(df, atr_values)
 
     # --- Session feature ---
     # Gold sessions: Asian 00-08 UTC (low vol), London 08-13 (breakout),
@@ -958,33 +1138,21 @@ class GoldTradingEnv(gym.Env):
             if trend_bearish and sma_ratio > 1.002:
                 return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 2: D/S zone nearby + CHOCH structure confirmation ---
-        # Key insight from trader charts: enter at D/S zone AFTER CHOCH confirms reversal
-        # Without CHOCH, the zone might fail (structure not ready)
+        # --- Condition 2: D/S zone nearby (proven best — no hard CHOCH requirement) ---
+        # CHOCH/RBR/SRF are in OBSERVATION → agent LEARNS to use them
+        # Forcing them as mask conditions reduces trades too much → agent can't learn
         zone_buy = False
         zone_sell = False
         if "demand_active" in self.df.columns:
-            demand = float(self.df["demand_active"].iloc[step])
-            supply = float(self.df["supply_active"].iloc[step])
+            demand  = float(self.df["demand_active"].iloc[step])
+            supply  = float(self.df["supply_active"].iloc[step])
             ds_dist = abs(float(self.df["ds_distance"].iloc[step]))
             near = ds_dist < self.mask_zone_threshold
-
-            # CHOCH or bullish structure = trade direction confirmed
-            choch_bull  = float(self.df["choch_bullish"].iloc[step])  if "choch_bullish"  in self.df.columns else 0.0
-            choch_bear  = float(self.df["choch_bearish"].iloc[step])  if "choch_bearish"  in self.df.columns else 0.0
-            struct_bull = float(self.df["struct_bullish"].iloc[step]) if "struct_bullish" in self.df.columns else 1.0
-            struct_bear = float(self.df["struct_bearish"].iloc[step]) if "struct_bearish" in self.df.columns else 1.0
-
-            # Demand zone: need CHOCH bullish OR already in bullish structure
-            bull_confirmed = (choch_bull > 0.0) or (struct_bull > 0.5)
-            # Supply zone: need CHOCH bearish OR already in bearish structure
-            bear_confirmed = (choch_bear > 0.0) or (struct_bear > 0.5)
-
-            zone_buy  = (demand > 0.5) and near and bull_confirmed
-            zone_sell = (supply > 0.5) and near and bear_confirmed
+            zone_buy  = (demand > 0.5) and near
+            zone_sell = (supply > 0.5) and near
 
         if not (zone_buy or zone_sell):
-            return np.array([True, False, False], dtype=bool)  # no confirmed zone
+            return np.array([True, False, False], dtype=bool)
 
         # --- Condition 3: Active session ---
         if self.mask_require_session and "is_active_session" in self.df.columns:
