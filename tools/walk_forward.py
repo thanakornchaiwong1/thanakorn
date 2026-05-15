@@ -30,8 +30,9 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Force UTF-8 for stdout (Windows Thai cp874 ไม่รองรับ unicode เช่น ±, →)
+# line_buffering=True ensures each print() flushes immediately (critical for background tasks)
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
