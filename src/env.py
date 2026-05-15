@@ -51,10 +51,14 @@ FEATURE_COLUMNS = [
     # Market context
     "is_active_session",
     "candle_body_ratio",
-    # NOTE: CHOCH/RBR/SRF/structure features ARE computed (in DataFrame)
+    # NOTE: CHOCH/RBR/structure features ARE computed (in DataFrame)
     # but excluded from observation — adding them consistently hurts performance
-    # (CHOCH 55% active = noisy; RBR 2% active = too rare to learn from)
-    # The MASK already handles quality filtering via trend+zone+candle confirmation
+    # (CHOCH 34% active alone = noisy; RBR 2% active = too rare to learn from)
+    # The MASK uses CHOCH as path-2 confirmation (demand+choch = +7% WR edge)
+    #
+    # SRF: oracle test shows +3.7% WR edge → included in observation
+    # so agent can LEARN which SRF setups are worth taking
+    "srf_bull_dist",  # distance to nearest bullish SRF (oracle: +3.7% WR edge)
 ]
 
 DAILY_FEATURE_COLUMNS = [
@@ -67,6 +71,21 @@ DAILY_FEATURE_COLUMNS = [
     "d_atr_ratio",
     "d_bb_position",
     "d_trend_strength",   # composite trend score
+]
+
+# H1 features (resampled from M15) — 9 features same count as daily
+# H1 gives timelier trend signal than D1 for M15 scalping
+# "D1 มันใหญ่เกินไป สำหรับ M15" — user feedback
+H1_FEATURE_COLUMNS = [
+    "h1_rsi",
+    "h1_macd_diff",
+    "h1_returns_1h",
+    "h1_returns_4h",      # 4H momentum (4 x H1 bars)
+    "h1_sma_20_ratio",    # 20 H1 bars ≈ 1 day
+    "h1_sma_50_ratio",    # 50 H1 bars ≈ 2 days
+    "h1_atr_ratio",
+    "h1_bb_position",
+    "h1_trend_strength",  # composite: sma_align + macd (key mask feature)
 ]
 
 
@@ -804,6 +823,108 @@ def merge_daily_into_primary(
     return merged
 
 
+def compute_h1_features(df_m15: pd.DataFrame) -> pd.DataFrame:
+    """
+    คำนวณ H1 features โดย resample จาก M15 DataFrame.
+
+    M15 df ต้องมี datetime index และ columns: open, high, low, close
+
+    H1 ให้ trend signal ที่ timely กว่า D1 สำหรับ M15 scalping:
+      - 20 H1 bars = ~1 day (vs D1 SMA20 = 20 วัน)
+      - H1 trend สะท้อน intraday structure ที่ agent เทรดอยู่
+      - ไม่ slow เกิน (D1) ไม่ noisy เกิน (M15)
+
+    คืน DataFrame ที่มีเฉพาะ H1_FEATURE_COLUMNS + datetime index
+    """
+    from ta.trend import SMAIndicator, MACD
+    from ta.momentum import RSIIndicator
+    from ta.volatility import BollingerBands, AverageTrueRange
+
+    # Resample M15 → H1
+    df_m15 = df_m15.copy()
+    df_m15.columns = [c.lower() for c in df_m15.columns]
+
+    # Keep only OHLC for resampling (volume optional)
+    ohlc_cols = {c: "first" if c == "open" else
+                    "max"   if c == "high" else
+                    "min"   if c == "low"  else
+                    "last"  if c == "close" else
+                    "sum"   for c in df_m15.columns if c in ("open","high","low","close","volume")}
+
+    df_h1 = df_m15.resample("1h").agg(ohlc_cols).dropna()
+    df_h1.columns = [c.lower() for c in df_h1.columns]
+
+    if len(df_h1) < 60:
+        raise ValueError(f"H1 data too short ({len(df_h1)} bars) — need ≥60 for indicators")
+
+    # Returns
+    df_h1["h1_returns_1h"] = df_h1["close"].pct_change()
+    df_h1["h1_returns_4h"] = df_h1["close"].pct_change(4)   # 4H momentum
+
+    # RSI(14) on H1
+    df_h1["h1_rsi"] = RSIIndicator(df_h1["close"], window=14).rsi() / 100.0
+
+    # SMA: 20 H1 ≈ 1 day, 50 H1 ≈ 2 days
+    sma_20 = SMAIndicator(df_h1["close"], window=20).sma_indicator()
+    sma_50 = SMAIndicator(df_h1["close"], window=50).sma_indicator()
+    df_h1["h1_sma_20_ratio"] = df_h1["close"] / sma_20
+    df_h1["h1_sma_50_ratio"] = df_h1["close"] / sma_50
+
+    # MACD
+    macd = MACD(df_h1["close"])
+    df_h1["h1_macd_diff"] = macd.macd_diff() / df_h1["close"]
+
+    # Bollinger Bands
+    bb = BollingerBands(df_h1["close"])
+    bb_high = bb.bollinger_hband()
+    bb_low  = bb.bollinger_lband()
+    df_h1["h1_bb_position"] = (df_h1["close"] - bb_low) / (bb_high - bb_low + 1e-9)
+
+    # ATR
+    atr = AverageTrueRange(df_h1["high"], df_h1["low"], df_h1["close"])
+    df_h1["h1_atr_ratio"] = atr.average_true_range() / df_h1["close"]
+
+    # Composite trend: same formula as daily but on H1
+    sma_align = (sma_20 - sma_50) / df_h1["close"]
+    macd_norm  = df_h1["h1_macd_diff"]
+    df_h1["h1_trend_strength"] = (sma_align * 10 + macd_norm * 25).clip(-1.0, 1.0)
+
+    return df_h1[H1_FEATURE_COLUMNS].dropna()
+
+
+def merge_h1_into_primary(
+    df_primary: pd.DataFrame,
+    df_h1_features: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Merge H1 features เข้า M15 DataFrame โดย:
+    - shift(1) ของ H1 — ใช้ H1 bar ที่ปิดสมบูรณ์แล้ว -> ไม่ look-ahead
+      (H1 bar 09:00-10:00 ใช้ใน M15 bars ของ 10:00 เป็นต้นไป)
+    - reindex + forward-fill เข้า M15 timeline
+      (ทุก M15 bar ในชั่วโมงเดียวกัน ใช้ H1 bar ก่อนหน้า)
+
+    Both DataFrames ต้องมี datetime index
+    """
+    # Strip timezone
+    if df_primary.index.tz is not None:
+        df_primary = df_primary.copy()
+        df_primary.index = df_primary.index.tz_localize(None)
+    if df_h1_features.index.tz is not None:
+        df_h1_features = df_h1_features.copy()
+        df_h1_features.index = df_h1_features.index.tz_localize(None)
+
+    # shift(1): use previous completed H1 bar (no look-ahead)
+    h1_safe = df_h1_features.shift(1).dropna()
+
+    # Forward-fill into M15 timeline
+    h1_aligned = h1_safe.reindex(df_primary.index, method="ffill")
+
+    # Merge
+    merged = pd.concat([df_primary, h1_aligned], axis=1)
+    merged = merged.dropna()
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
@@ -860,9 +981,9 @@ class GoldTradingEnv(gym.Env):
     ):
         super().__init__()
 
-        # Auto-detect feature columns
+        # Auto-detect feature columns (M15 + H1 + D1 if available)
         if feature_columns is None:
-            all_known = FEATURE_COLUMNS + DAILY_FEATURE_COLUMNS
+            all_known = FEATURE_COLUMNS + H1_FEATURE_COLUMNS + DAILY_FEATURE_COLUMNS
             feature_columns = [c for c in all_known if c in df.columns]
             if not feature_columns:
                 raise ValueError(
@@ -1100,9 +1221,12 @@ class GoldTradingEnv(gym.Env):
         Returns bool array [Hold_ok, Buy_ok, Sell_ok].
 
         Setup conditions (ALL must be met for entry to be allowed):
-          1. Strong trend: |d_trend_strength| > mask_trend_threshold
-          2. D/S zone nearby: (demand/supply active) AND |ds_distance| < mask_zone_threshold
-          3. Active session: is_active_session = 1  (if mask_require_session=True)
+          1. H1 trend (or D1): |h1_trend_strength| > mask_trend_threshold (prefers H1)
+          2. Zone condition (either path):
+               Path A: price INSIDE D/S zone (ds_distance < 0.5) — WR +10.7%
+               Path B: near zone (< mask_zone_threshold) + recent CHOCH — WR +7.0%
+          3. Active session: is_active_session = 1 (if mask_require_session=True)
+          4. Confirmation candle: body_ratio > 0.4 AND directional
 
         Direction aligned:
           - Bullish trend → only Buy allowed
@@ -1121,10 +1245,12 @@ class GoldTradingEnv(gym.Env):
         step = self.current_step
 
         # --- Condition 1: Trend (4-bar average — proven best) ---
+        # H1 trend preferred over D1 (more timely for M15 scalping)
         trend = 0.0
-        if "d_trend_strength" in self.df.columns:
+        trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns else "d_trend_strength"
+        if trend_col in self.df.columns:
             lookback = min(4, step)
-            trend = float(self.df["d_trend_strength"].iloc[max(0, step-lookback):step+1].mean())
+            trend = float(self.df[trend_col].iloc[max(0, step-lookback):step+1].mean())
         trend_bullish = trend > self.mask_trend_threshold
         trend_bearish = trend < -self.mask_trend_threshold
         if not (trend_bullish or trend_bearish):
@@ -1138,18 +1264,41 @@ class GoldTradingEnv(gym.Env):
             if trend_bearish and sma_ratio > 1.002:
                 return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 2: D/S zone nearby (proven best — no hard CHOCH requirement) ---
-        # CHOCH/RBR/SRF are in OBSERVATION → agent LEARNS to use them
-        # Forcing them as mask conditions reduces trades too much → agent can't learn
+        # --- Condition 2: D/S zone — Oracle-proven two-path approach ---
+        #
+        # Oracle test findings (on 200k M15 bars, SL=1.5 TP=4.5):
+        #   - dist < 0.5 (inside zone):           WR 35.6%  (+10.7% vs random)
+        #   - demand + CHOCH (dist < 1.5):         WR 31.9%  (+7.0%)
+        #   - demand alone (dist < 1.5):           WR 26.0%  (+1.1%)  ← too weak
+        #
+        # Two valid paths:
+        #   Path 1: price INSIDE zone (ds_distance < 0.5)  ← strongest edge
+        #   Path 2: near zone (dist < mask_zone_threshold) + recent CHOCH ← +7% combo
+        #
         zone_buy = False
         zone_sell = False
         if "demand_active" in self.df.columns:
             demand  = float(self.df["demand_active"].iloc[step])
             supply  = float(self.df["supply_active"].iloc[step])
             ds_dist = abs(float(self.df["ds_distance"].iloc[step]))
-            near = ds_dist < self.mask_zone_threshold
-            zone_buy  = (demand > 0.5) and near
-            zone_sell = (supply > 0.5) and near
+
+            # Path 1: inside zone
+            inside_demand = (demand > 0.5) and (ds_dist < 0.5)
+            inside_supply = (supply > 0.5) and (ds_dist < 0.5)
+
+            # Path 2: near zone + CHOCH (oracle: demand+choch = +7% WR edge)
+            choch_bull = 0.0
+            choch_bear = 0.0
+            if "choch_bullish" in self.df.columns:
+                choch_bull = float(self.df["choch_bullish"].iloc[step])
+                choch_bear = float(self.df["choch_bearish"].iloc[step])
+
+            near = ds_dist < self.mask_zone_threshold  # wider (1.5) for CHOCH path
+            near_demand_choch = (demand > 0.5) and near and (choch_bull > 0.1)
+            near_supply_choch = (supply > 0.5) and near and (choch_bear > 0.1)
+
+            zone_buy  = inside_demand or near_demand_choch
+            zone_sell = inside_supply or near_supply_choch
 
         if not (zone_buy or zone_sell):
             return np.array([True, False, False], dtype=bool)
@@ -1183,9 +1332,11 @@ class GoldTradingEnv(gym.Env):
     # Direction-Invariant Helpers
     # ------------------------------------------------------------------
     def _get_trend_direction(self) -> int:
-        """Returns +1 if bullish, -1 if bearish, 0 if neutral."""
-        if "d_trend_strength" in self.df.columns:
-            t = float(self.df["d_trend_strength"].iloc[self.current_step])
+        """Returns +1 if bullish, -1 if bearish, 0 if neutral.
+        Prefers H1 trend over D1 — more timely for M15 scalping."""
+        trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns else "d_trend_strength"
+        if trend_col in self.df.columns:
+            t = float(self.df[trend_col].iloc[self.current_step])
             if t > self.mask_trend_threshold:
                 return 1
             if t < -self.mask_trend_threshold:
@@ -1240,6 +1391,17 @@ class GoldTradingEnv(gym.Env):
                 out[:, i] *= -1
 
         for col in ["d_rsi", "d_bb_position"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] = 1.0 - out[:, i]
+
+        # --- H1 features (same flip logic as daily) ---
+        for col in ["h1_macd_diff", "h1_returns_1h", "h1_returns_4h", "h1_trend_strength"]:
+            i = idx(col)
+            if i is not None:
+                out[:, i] *= -1
+
+        for col in ["h1_rsi", "h1_bb_position"]:
             i = idx(col)
             if i is not None:
                 out[:, i] = 1.0 - out[:, i]

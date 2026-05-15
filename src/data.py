@@ -21,12 +21,16 @@ try:
         prepare_features,
         compute_daily_features,
         merge_daily_into_primary,
+        compute_h1_features,
+        merge_h1_into_primary,
     )
 except ImportError:
     from env import (  # type: ignore
         prepare_features,
         compute_daily_features,
         merge_daily_into_primary,
+        compute_h1_features,
+        merge_h1_into_primary,
     )
 
 
@@ -150,29 +154,43 @@ def load_data(cfg: dict) -> pd.DataFrame:
         return df
 
     # ----- Multi-timeframe path -----
-    print(f"  multi-timeframe enabled: primary={dcfg['interval']}, secondary=1d")
+    use_h1 = dcfg.get("use_h1_from_m15", True)   # default ON: H1 from M15 resample
+    use_d1 = bool(dcfg.get("csv_daily_path"))     # D1 only if csv provided
 
-    # Load daily data: from csv_daily_path or yfinance
-    daily_csv = dcfg.get("csv_daily_path")
-    if daily_csv:
-        print(f"  loading daily from CSV: {daily_csv}")
-        df_daily_raw = load_csv(daily_csv, parse_time=True)
-    else:
-        print(f"  fetching daily data for macro features...")
-        df_daily_raw = load_yfinance(dcfg["symbol"], "1d", dcfg["period"])
+    print(f"  multi-timeframe enabled: primary={dcfg['interval']}"
+          f"{', +H1 (resampled)' if use_h1 else ''}"
+          f"{', +D1' if use_d1 else ''}")
 
     # 1) Compute primary features (keep datetime index for merge)
     df_primary_features = prepare_features(df_primary_raw, reset_index=False)
+    df_merged = df_primary_features.copy()
 
-    # 2) Compute daily features
-    df_daily_features = compute_daily_features(df_daily_raw)
+    # 2) H1 features (resampled from M15 — timelier than D1 for scalping)
+    if use_h1:
+        try:
+            df_h1_features = compute_h1_features(df_primary_raw)
+            df_merged = merge_h1_into_primary(df_merged, df_h1_features)
+            print(f"  H1 rows: {len(df_h1_features)}, merged rows after H1: {len(df_merged)}")
+        except Exception as e:
+            print(f"  ⚠️  H1 compute failed ({e}), skipping H1 features")
 
-    # 3) Merge: shift(1) prevents look-ahead, ffill aligns to primary timeline
-    df_merged = merge_daily_into_primary(df_primary_features, df_daily_features)
+    # 3) D1 features (optional — only if csv_daily_path provided)
+    if use_d1:
+        daily_csv = dcfg["csv_daily_path"]
+        print(f"  loading daily from CSV: {daily_csv}")
+        df_daily_raw = load_csv(daily_csv, parse_time=True)
+        df_daily_features = compute_daily_features(df_daily_raw)
+        df_merged = merge_daily_into_primary(df_merged, df_daily_features)
+        print(f"  D1 rows: {len(df_daily_features)}, merged rows after D1: {len(df_merged)}")
+    elif not use_h1 and not use_d1:
+        # Fallback: fetch D1 from yfinance
+        print(f"  fetching daily data for macro features...")
+        df_daily_raw = load_yfinance(dcfg["symbol"], "1d", dcfg["period"])
+        df_daily_features = compute_daily_features(df_daily_raw)
+        df_merged = merge_daily_into_primary(df_merged, df_daily_features)
 
     print(f"  primary rows: {len(df_primary_features)}, "
-          f"daily rows: {len(df_daily_features)}, "
-          f"merged rows: {len(df_merged)}")
+          f"total rows: {len(df_merged)}")
 
     return df_merged.reset_index(drop=True)
 

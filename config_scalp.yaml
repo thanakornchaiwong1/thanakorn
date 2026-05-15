@@ -10,9 +10,10 @@ data:
   interval: "15m"
   period: null
   csv_path: "./data/xauusd_m15.csv"
-  csv_daily_path: "./data/xauusd_d1.csv"
+  csv_daily_path: null           # D1 disabled — using H1 (timelier for M15 scalping)
   train_test_split: 0.8
   use_multi_timeframe: true
+  use_h1_from_m15: true          # Resample M15→H1 for trend signal (replaces D1)
 
 env:
   initial_balance: 10000.0
@@ -30,7 +31,7 @@ env:
   use_lstm: false
   # Action masking
   use_action_mask: true               # THE key change
-  mask_trend_threshold: 0.1          # |trend| > 0.1 covers ~60% of bars
+  mask_trend_threshold: 0.03         # H1 trend: 0.03 = ~44% raw / ~25% after 4-bar MA (calibrated for H1 scale)
   mask_zone_threshold: 1.5           # ds_distance < 1.5 (proven best)
   mask_require_session: false        # session is reward bonus, not hard requirement
 
