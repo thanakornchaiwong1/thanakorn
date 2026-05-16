@@ -1400,33 +1400,21 @@ class GoldTradingEnv(gym.Env):
                 can_short = True  # SHORT: momentum breakdown confirmed
 
         # ─────────────────────────────────────────────────────────────────
-        # PATH 2: DBR Demand Zone LONG (oracle-proven)
+        # NOTE: DBR Path2 LONG (demand + ATR contraction + body) tested but removed.
         #
-        #   DBR = Drop-Base-Rally (ผู้ใช้ chart analysis):
-        #     ราคา drop ถึง demand zone → ทำ BASE (consolidate) → RALLY ขึ้น
+        # Oracle shows WR 29.1% standalone, BUT walk-forward with 500k timesteps
+        # showed 1/7 profitable folds when combined with CHOCH.
+        # Root cause: agent cannot learn 2 distinct patterns (CHOCH + DBR) simultaneously
+        # with 500k timesteps — policy becomes confused.
         #
-        #   Entry signal: base forming at demand (ATR contracting) + bullish body
-        #   Oracle: Cons60% + demand + ATR contract(<0.85) + body = WR 29.1% (+4.2%)
+        # Solution: keep atr_contraction in OBSERVATION (agent learns contextually)
+        # Re-enable as mask path if timesteps increase to 1M+ in future.
         #
-        #   ทำไมต้อง ATR contraction (ไม่ใช่แค่ demand + pullback):
-        #     demand + pullback_down + body = WR 18.6% [BAD] ← เข้าตอนกำลังลงอยู่
-        #     demand + ATR contract  + body = WR 29.1% [EDGE] ← เข้าตอน base ยืนยัน
-        #
-        #   ทำไม Consistency ใช้ได้สำหรับ DBR (ต่างจาก supply reversal):
-        #     Supply reversal: ดีกว่ากับ snapshot (เข้าตอน H1 เพิ่งกลับทิศ)
-        #     DBR demand:      ดีกว่ากับ consistency (uptrend ยาว = demand zone แข็งแกร่ง)
+        # Oracle reference: Cons60% + demand + atr_contract(<0.85) + body = WR 29.1%
         # ─────────────────────────────────────────────────────────────────
-        if (trend_bullish and bullish_bar
-                and "demand_active" in self.df.columns
-                and "atr_contraction" in self.df.columns):
-            demand_val   = float(self.df["demand_active"].iloc[step])
-            atr_cont_val = float(self.df["atr_contraction"].iloc[step])
-            # atr_contraction < 0.85 = base forming (5-bar ATR < 85% of 20-bar ATR)
-            if demand_val > 0.5 and atr_cont_val < 0.85:
-                can_long = True  # LONG: base at demand confirmed → rally expected
 
         # ─────────────────────────────────────────────────────────────────
-        # PATH 3 (was PATH 2): Supply Reversal SHORT only (oracle-proven)
+        # PATH 2: Supply Reversal SHORT only (oracle-proven)
         #
         #   SHORT: H1 bear + supply_active + pullback_up + bearish body
         #     Oracle (snapshot): WR 28.3% (+4.5%) — 138 trades
