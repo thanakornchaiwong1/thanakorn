@@ -59,6 +59,10 @@ FEATURE_COLUMNS = [
     "engulfing_bear",
     "engulfing_bull",
     "m15_pullback",
+    # atr_contraction: 5-bar ATR / 20-bar ATR
+    # < 0.85 = consolidation/base forming (DBR signal)
+    # > 1.0  = expansion/impulse (CHOCH / breakout signal)
+    "atr_contraction",
     # CHOCH re-added to observation after fixing:
     # OLD: 5-bar pivot → 34.8% active (too noisy to learn from)
     # NEW: 20-bar pivot, 8-bar memory → 5.9% active = real events
@@ -792,6 +796,17 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
     bull_engulfs = (df["open"] <= prev_close) & (df["close"] >= prev_open)
     df["engulfing_bull"] = (prev_bearish & curr_bullish & bull_engulfs).astype(np.float32)
 
+    # --- ATR Contraction (base/consolidation detection) ---
+    # DBR (Drop-Base-Rally): ราคา drop ถึง demand → BASE (consolidate) → RALLY
+    # The "base" = ATR contracting: candles getting smaller = tight range
+    # atr_contraction < 1.0 = current ATR below medium-term average (base forming)
+    # Oracle: Cons60% + demand + ATR contract + body = WR 29.1% (+4.2%) [EDGE]
+    atr_price      = (df["atr_ratio"] * df["close"]).replace(0.0, 1e-9)
+    atr_short      = atr_price.rolling(5,  min_periods=1).mean()   # 5-bar ATR
+    atr_medium     = atr_price.rolling(20, min_periods=5).mean()   # 20-bar ATR
+    df["atr_contraction"] = (atr_short / (atr_medium + 1e-9)).clip(0.3, 2.0).astype(np.float32)
+    # < 0.85 = contracting (base forming), > 1.0 = expanding (impulse/volatile)
+
     # --- M15 Pullback Strength (3-bar normalized price change) ---
     # Measures: how many ATR units has price moved over the last 3 bars (45 min on M15)
     # +1.0 = price rose 1 ATR   → strong pullback UP into supply zone
@@ -1385,7 +1400,33 @@ class GoldTradingEnv(gym.Env):
                 can_short = True  # SHORT: momentum breakdown confirmed
 
         # ─────────────────────────────────────────────────────────────────
-        # PATH 2: Supply Reversal SHORT only (oracle-proven)
+        # PATH 2: DBR Demand Zone LONG (oracle-proven)
+        #
+        #   DBR = Drop-Base-Rally (ผู้ใช้ chart analysis):
+        #     ราคา drop ถึง demand zone → ทำ BASE (consolidate) → RALLY ขึ้น
+        #
+        #   Entry signal: base forming at demand (ATR contracting) + bullish body
+        #   Oracle: Cons60% + demand + ATR contract(<0.85) + body = WR 29.1% (+4.2%)
+        #
+        #   ทำไมต้อง ATR contraction (ไม่ใช่แค่ demand + pullback):
+        #     demand + pullback_down + body = WR 18.6% [BAD] ← เข้าตอนกำลังลงอยู่
+        #     demand + ATR contract  + body = WR 29.1% [EDGE] ← เข้าตอน base ยืนยัน
+        #
+        #   ทำไม Consistency ใช้ได้สำหรับ DBR (ต่างจาก supply reversal):
+        #     Supply reversal: ดีกว่ากับ snapshot (เข้าตอน H1 เพิ่งกลับทิศ)
+        #     DBR demand:      ดีกว่ากับ consistency (uptrend ยาว = demand zone แข็งแกร่ง)
+        # ─────────────────────────────────────────────────────────────────
+        if (trend_bullish and bullish_bar
+                and "demand_active" in self.df.columns
+                and "atr_contraction" in self.df.columns):
+            demand_val   = float(self.df["demand_active"].iloc[step])
+            atr_cont_val = float(self.df["atr_contraction"].iloc[step])
+            # atr_contraction < 0.85 = base forming (5-bar ATR < 85% of 20-bar ATR)
+            if demand_val > 0.5 and atr_cont_val < 0.85:
+                can_long = True  # LONG: base at demand confirmed → rally expected
+
+        # ─────────────────────────────────────────────────────────────────
+        # PATH 3 (was PATH 2): Supply Reversal SHORT only (oracle-proven)
         #
         #   SHORT: H1 bear + supply_active + pullback_up + bearish body
         #     Oracle (snapshot): WR 28.3% (+4.5%) — 138 trades
