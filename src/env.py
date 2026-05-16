@@ -63,6 +63,11 @@ FEATURE_COLUMNS = [
     # < 0.85 = consolidation/base forming (DBR signal)
     # > 1.0  = expansion/impulse (CHOCH / breakout signal)
     "atr_contraction",
+    # atr_zscore: (ATR - rolling_mean) / rolling_std over 200 bars
+    # > 2.0 = EXTREME spike (news/event) → mask blocks entry [WR 16% = very bad]
+    # -1.5 to 1.5 = NORMAL regime [WR 28.9%]
+    # < -1.0 = LOW vol → actually GOOD [WR 34.7%] → do NOT block
+    "atr_zscore",
     # CHOCH re-added to observation after fixing:
     # OLD: 5-bar pivot → 34.8% active (too noisy to learn from)
     # NEW: 20-bar pivot, 8-bar memory → 5.9% active = real events
@@ -807,6 +812,17 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
     df["atr_contraction"] = (atr_short / (atr_medium + 1e-9)).clip(0.3, 2.0).astype(np.float32)
     # < 0.85 = contracting (base forming), > 1.0 = expanding (impulse/volatile)
 
+    # --- ATR Z-Score (regime filter) ---
+    # Measures: how abnormal is current volatility vs recent history (200 bars = ~50h)
+    # z > 2.0 = EXTREME spike (news event) → WR 16.0% (-8.9%) → BLOCK in mask
+    # z > 1.5 = HIGH vol → WR 24.8% ≈ random → marginal
+    # z -1.5 to 1.5 = NORMAL → WR 28.9% (+4.0%) → trade normally
+    # z < -1.0 = LOW vol → WR 34.7% (+9.8%) → GOOD, do NOT block!
+    # Oracle: excluding z>2.0 → WR 29.4% (+4.5%), lose only 5.6% of opportunities
+    atr_roll200_mean = atr_price.rolling(200, min_periods=50).mean()
+    atr_roll200_std  = atr_price.rolling(200, min_periods=50).std().replace(0.0, 1e-9)
+    df["atr_zscore"] = ((atr_price - atr_roll200_mean) / atr_roll200_std).clip(-4.0, 4.0).fillna(0.0).astype(np.float32)
+
     # --- M15 Pullback Strength (3-bar normalized price change) ---
     # Measures: how many ATR units has price moved over the last 3 bars (45 min on M15)
     # +1.0 = price rose 1 ATR   → strong pullback UP into supply zone
@@ -1443,7 +1459,16 @@ class GoldTradingEnv(gym.Env):
         if not (can_long or can_short):
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 4: Active session (optional) ---
+        # --- Condition 4: ATR Regime Filter (always on) ---
+        # Block during EXTREME volatility spikes (news events, flash crashes)
+        # Oracle: z>2.0 → WR 16.0% (-8.9%) = worst regime, only 5.6% of bars
+        # Low volatility (z<-1.0) → WR 34.7% = actually GOOD, do NOT block
+        if "atr_zscore" in self.df.columns:
+            atr_z = float(self.df["atr_zscore"].iloc[step])
+            if atr_z > 2.0:  # extreme spike → skip entry
+                return np.array([True, False, False], dtype=bool)
+
+        # --- Condition 5: Active session (optional) ---
         if self.mask_require_session and "is_active_session" in self.df.columns:
             if float(self.df["is_active_session"].iloc[step]) < 0.5:
                 return np.array([True, False, False], dtype=bool)
