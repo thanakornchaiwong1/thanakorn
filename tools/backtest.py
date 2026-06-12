@@ -34,6 +34,7 @@ _SIM = {
     "raw": {},        # tf -> structured array (full history, sorted by time)
     "now": 0,         # current sim epoch (วินาที) = เวลาปิด M1 bar ปัจจุบัน
     "positions": [],  # list ของ dict: {ticket,type,price_open,sl,tp,magic,comment,volume,time,strategy}
+    "closed": [],     # trades ที่ momentum/smart exit ปิด (ผ่าน mock order_send)
     "next_ticket": 1000,
     "symbol": "XAUUSD.iux",
     "digits": 2,
@@ -134,13 +135,28 @@ def _mock_symbol_info(symbol):
     return _SymInfo()
 
 def _mock_order_send(req):
-    # ใช้สำหรับ submit_order เพื่อให้คืน SL/TP — fill ที่ราคา req price
     r = type("R", (), {})()
     r.retcode = mt5.TRADE_RETCODE_DONE
-    r.order = _SIM["next_ticket"]; _SIM["next_ticket"] += 1
-    r.price = req.get("price", _cur_m1_close())
     r.volume = req.get("volume", 0.05)
     r.comment = "sim"
+    # CLOSE order (momentum/smart exit มี "position": ticket) → ปิด sim position + บันทึก
+    pos_tk = req.get("position")
+    if pos_tk:
+        price = req.get("price", _cur_m1_close())
+        for p in list(_SIM["positions"]):
+            if p["ticket"] == pos_tk:
+                diff = (price - p["price_open"]) if p["type"] == 0 else (p["price_open"] - price)
+                pnl = diff * p["volume"] * _SymInfo.trade_contract_size
+                _SIM["closed"].append({**p, "exit": price, "exit_ep": _SIM["now"], "pnl": pnl,
+                                       "result": "WIN" if pnl > 0 else "LOSS"})
+                _SIM["positions"].remove(p)
+                _SIM["last_close_ep"] = _SIM["now"]
+                break
+        r.order = pos_tk
+        return r
+    # ENTRY probe (submit_order ใช้เพื่อคืน SL/TP) — ไม่เปิด position เอง (run loop เปิด)
+    r.order = _SIM["next_ticket"]; _SIM["next_ticket"] += 1
+    r.price = req.get("price", _cur_m1_close())
     return r
 
 def _mock_history_deals_get(*a, **k):
@@ -217,7 +233,7 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
     print(f"\nReplaying {len(steps)} M1 bars ({start} → {end})...\n")
 
     trades = []   # closed trades
-    last_close_ep = 0
+    _SIM["last_close_ep"] = 0
 
     for i, bar in enumerate(steps):
         _SIM["now"] = int(bar["time"]) + 60   # เวลา "ปิด" M1 bar นี้
@@ -237,11 +253,14 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
                 diff = (exitpx - p["price_open"]) if p["type"] == 0 else (p["price_open"] - exitpx)
                 pnl = diff * p["volume"] * _SymInfo.trade_contract_size
                 trades.append({**p, "exit": exitpx, "exit_ep": _SIM["now"], "pnl": pnl, "result": "WIN" if pnl > 0 else "LOSS"})
-                last_close_ep = _SIM["now"]
+                _SIM["last_close_ep"] = _SIM["now"]
             else:
                 still_open.append(p)
         _SIM["positions"] = still_open
 
+        # 1b) v2 smart-exit DISABLED — ต้อง sim auto_tuner ด้วย ไม่งั้น over-state (future work)
+        #     sb.momentum_exit_check(symbol); sb.smart_exit_check(symbol)
+        last_close_ep = _SIM["last_close_ep"]
         # 2) decision
         try:
             dec = sb.make_decision(bridge, classifier)
