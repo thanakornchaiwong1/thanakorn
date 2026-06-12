@@ -36,6 +36,7 @@ _SIM = {
     "positions": [],  # list ของ dict: {ticket,type,price_open,sl,tp,magic,comment,volume,time,strategy}
     "closed": [],     # trades ที่ momentum/smart exit ปิด (ผ่าน mock order_send)
     "regime_map": [], # {strategy,regime,pnl,exit_ep} ของไม้ปิด → ใช้ sim auto_tuner
+    "skip": set(),    # strategies ที่ไม่เทรด (ทดสอบ disable)
     "next_ticket": 1000,
     "symbol": "XAUUSD.iux",
     "digits": 2,
@@ -291,9 +292,23 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
 
         direction = dec["final_action"].lower()
         strat = dec["strategy"]
+        if strat in _SIM["skip"]:
+            continue
         cur_regime = dec.get("regime", "chop")
+        # ── experiment filters (system-level) ──
+        if _SIM.get("f_skip_chop") and cur_regime == "chop":
+            continue
+        if _SIM.get("f_no_counter"):
+            if (cur_regime == "trend_bear" and direction == "long") or \
+               (cur_regime == "trend_bull" and direction == "short"):
+                continue
+        if _SIM.get("f_chop_no_counter") and cur_regime == "chop":
+            # chop: เข้าเฉพาะถ้าตรง M15 trend label (dec['m15_trend'])
+            mt = dec.get("m15_trend", "")
+            if (mt == "BEAR" and direction == "long") or (mt == "BULL" and direction == "short"):
+                continue
         # auto_tuner sim: block combo ที่ขาดทุนซ้ำ (เหมือน live)
-        if _sim_is_blocked(strat, cur_regime, _SIM["now"]):
+        if not _SIM.get("no_autotuner") and _sim_is_blocked(strat, cur_regime, _SIM["now"]):
             continue
         # position mgmt (เบื้องต้น): cooldown + MAX_POS (same-dir cap 3) + stacking $2
         if (_SIM["now"] - last_close_ep) < cooldown_sec:
