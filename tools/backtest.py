@@ -35,6 +35,7 @@ _SIM = {
     "now": 0,         # current sim epoch (วินาที) = เวลาปิด M1 bar ปัจจุบัน
     "positions": [],  # list ของ dict: {ticket,type,price_open,sl,tp,magic,comment,volume,time,strategy}
     "closed": [],     # trades ที่ momentum/smart exit ปิด (ผ่าน mock order_send)
+    "regime_map": [], # {strategy,regime,pnl,exit_ep} ของไม้ปิด → ใช้ sim auto_tuner
     "next_ticket": 1000,
     "symbol": "XAUUSD.iux",
     "digits": 2,
@@ -166,6 +167,24 @@ def _noop(*a, **k):
     return True
 
 
+# ── auto_tuner sim (ตรงกับ tools/auto_tuner.py: MIN_TRADES=4, cut=-3, window=4d) ──
+_AT_MIN_TRADES = 4
+_AT_EXPECTANCY_CUT = -3.0
+_AT_WINDOW_SEC = 4 * 86400
+
+def _sim_is_blocked(strategy, regime, now_ep):
+    rel = [t for t in _SIM["regime_map"]
+           if t["strategy"] == strategy and t["regime"] == regime
+           and (now_ep - t["exit_ep"]) <= _AT_WINDOW_SEC]
+    if len(rel) < _AT_MIN_TRADES:
+        return False
+    return (sum(t["pnl"] for t in rel) / len(rel)) < _AT_EXPECTANCY_CUT
+
+def _record_regime(p, pnl):
+    _SIM["regime_map"].append({"strategy": p["strategy"], "regime": p.get("entry_regime", "chop"),
+                               "pnl": pnl, "exit_ep": _SIM["now"]})
+
+
 # ── Pull data ────────────────────────────────────────────────────────────────
 def pull_data(symbol, start, end, warmup_days=3):
     if not mt5.initialize():
@@ -253,6 +272,7 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
                 diff = (exitpx - p["price_open"]) if p["type"] == 0 else (p["price_open"] - exitpx)
                 pnl = diff * p["volume"] * _SymInfo.trade_contract_size
                 trades.append({**p, "exit": exitpx, "exit_ep": _SIM["now"], "pnl": pnl, "result": "WIN" if pnl > 0 else "LOSS"})
+                _record_regime(p, pnl)
                 _SIM["last_close_ep"] = _SIM["now"]
             else:
                 still_open.append(p)
@@ -270,6 +290,11 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
             continue
 
         direction = dec["final_action"].lower()
+        strat = dec["strategy"]
+        cur_regime = dec.get("regime", "chop")
+        # auto_tuner sim: block combo ที่ขาดทุนซ้ำ (เหมือน live)
+        if _sim_is_blocked(strat, cur_regime, _SIM["now"]):
+            continue
         # position mgmt (เบื้องต้น): cooldown + MAX_POS (same-dir cap 3) + stacking $2
         if (_SIM["now"] - last_close_ep) < cooldown_sec:
             continue
@@ -286,7 +311,6 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
             continue
 
         # 3) SL/TP via submit_order จริง (mock order_send)
-        strat = dec["strategy"]
         magic = sb.MAGIC_MAP.get(strat, 2099)
         atr_val = float(dec.get("atr", 0) or 0)
         res = sb.submit_order(symbol, direction, 0.05, atr_val, magic, comment=strat,
@@ -298,6 +322,7 @@ def run(symbol, start, end, max_pos=2, cooldown_sec=150):
             "ticket": res.get("order_id", _SIM["next_ticket"]), "type": 0 if direction == "long" else 1,
             "price_open": res["entry"], "sl": res["sl"], "tp": res["tp"], "magic": magic,
             "comment": strat, "volume": 0.05, "time": _SIM["now"], "strategy": strat,
+            "entry_regime": cur_regime,
         })
 
     # close remaining at last price (mark-to-market)
