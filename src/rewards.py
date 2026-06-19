@@ -998,35 +998,41 @@ def masked_sniper_reward(env, ctx: Dict[str, Any]) -> float:
     """
     Reward for Action-Masked Sniper — clean, outcome-focused.
 
-    Action masking already handles WHEN to trade (trend + zone + session).
-    This reward just teaches WHICH valid setups are better.
+    v2 fixes (2026-05):
+      BUG FIX: trend ride bonus used d_trend_strength (D1 disabled) → always 0
+               now uses h1_trend_strength which is always available
+      MAGNITUDE: TP +0.12→+0.25, SL -0.04→-0.08 (same 3:1 ratio, clearer signal)
+               EV per trade (WR=29%): was +0.006, now +0.013 (still positive but louder)
+      REASON: agent was learning Hold=0 > Trade(EV=+0.006, high variance)
+              larger magnitude breaks the local optimum
 
-    NO entry quality bonus needed — masking handles that.
-    Simple: big TP reward, small SL penalty, trend ride bonus.
-
-    TP=+0.12, SL=-0.04, trend_ride=+0.001/step, invalid=-0.01
+    TP=+0.25, SL=-0.08, h1_trend_ride=+0.002/step, invalid=-0.01
     """
     trade_closed: bool = ctx.get("trade_closed", False)
     action: int = ctx.get("action", 0)
     invalid: bool = ctx.get("invalid_action", False)
     reward = 0.0
 
-    # 1. TP/SL outcome (same proven values as v2)
+    # 1. TP/SL outcome — larger magnitude for clearer learning signal
     if trade_closed and len(env.trade_returns) > 0:
         pnl = env.trade_returns[-1]
         if pnl > 0:
-            reward += 0.12
+            reward += 0.25   # was 0.12 — clearer positive signal
         else:
-            reward -= 0.04
+            reward -= 0.08   # was 0.04 — clearer negative signal (ratio kept 3:1)
 
-    # 2. Trend ride bonus — teach agent to hold in direction of trend
-    if env.position != 0 and "d_trend_strength" in env.df.columns:
-        trend = float(env.df["d_trend_strength"].iloc[env.current_step])
+    # 2. H1 Trend ride bonus (FIX: was d_trend_strength which is disabled)
+    # h1_trend_strength is always available (resampled from M15)
+    # Gives intermediate reward while holding — breaks "don't trade" local optimum
+    trend_col = "h1_trend_strength" if "h1_trend_strength" in env.df.columns \
+                else "d_trend_strength"
+    if env.position != 0 and trend_col in env.df.columns:
+        trend = float(env.df[trend_col].iloc[env.current_step])
         aligned = env.position * trend
         if aligned > 0:
-            reward += 0.001 * min(aligned, 1.0)
+            reward += 0.002 * min(aligned, 1.0)   # was 0.001
         elif aligned < -0.3:
-            reward -= 0.0005
+            reward -= 0.001                         # was 0.0005
 
     # 3. Invalid action penalty
     if invalid:

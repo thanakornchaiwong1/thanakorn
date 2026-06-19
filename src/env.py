@@ -51,6 +51,23 @@ FEATURE_COLUMNS = [
     # Market context
     "is_active_session",
     "candle_body_ratio",
+    # Price action: Candle patterns (vectorized, no loop overhead)
+    # engulfing_bear: bullish→bearish full engulf = strong reversal at supply
+    # engulfing_bull: bearish→bullish full engulf = strong reversal at demand
+    # m15_pullback: 3-bar price change / ATR (+ve=price went up, -ve=went down)
+    #   Used in mask Path 2: supply reversal requires pullback_val > 0.3 ATR
+    "engulfing_bear",
+    "engulfing_bull",
+    "m15_pullback",
+    # atr_contraction: 5-bar ATR / 20-bar ATR
+    # < 0.85 = consolidation/base forming (DBR signal)
+    # > 1.0  = expansion/impulse (CHOCH / breakout signal)
+    "atr_contraction",
+    # atr_zscore: (ATR - rolling_mean) / rolling_std over 200 bars
+    # > 2.0 = EXTREME spike (news/event) → mask blocks entry [WR 16% = very bad]
+    # -1.5 to 1.5 = NORMAL regime [WR 28.9%]
+    # < -1.0 = LOW vol → actually GOOD [WR 34.7%] → do NOT block
+    "atr_zscore",
     # CHOCH re-added to observation after fixing:
     # OLD: 5-bar pivot → 34.8% active (too noisy to learn from)
     # NEW: 20-bar pivot, 8-bar memory → 5.9% active = real events
@@ -73,19 +90,24 @@ DAILY_FEATURE_COLUMNS = [
     "d_trend_strength",   # composite trend score
 ]
 
-# H1 features (resampled from M15) — 9 features same count as daily
+# H1 features (resampled from M15) — 11 features
 # H1 gives timelier trend signal than D1 for M15 scalping
 # "D1 มันใหญ่เกินไป สำหรับ M15" — user feedback
 H1_FEATURE_COLUMNS = [
     "h1_rsi",
     "h1_macd_diff",
     "h1_returns_1h",
-    "h1_returns_4h",      # 4H momentum (4 x H1 bars)
-    "h1_sma_20_ratio",    # 20 H1 bars ≈ 1 day
-    "h1_sma_50_ratio",    # 50 H1 bars ≈ 2 days
+    "h1_returns_4h",         # 4H momentum (4 x H1 bars)
+    "h1_sma_20_ratio",       # 20 H1 bars ≈ 1 day
+    "h1_sma_50_ratio",       # 50 H1 bars ≈ 2 days
     "h1_atr_ratio",
     "h1_bb_position",
-    "h1_trend_strength",  # composite: sma_align + macd (key mask feature)
+    "h1_trend_strength",     # composite: sma_align + macd (key mask feature)
+    # Consistency features (rolling 8 H1 bars = 8h window)
+    # Diagnosis: bad folds have H1 neutral 72-80% → CHOCH fires on noise
+    # Fix: require 60%+ of last 8 H1 bars in same direction = real trend
+    "h1_bull_consistency",   # fraction of last 8 H1 bars that are bullish (>0.05)
+    "h1_bear_consistency",   # fraction of last 8 H1 bars that are bearish (<-0.05)
 ]
 
 
@@ -761,6 +783,56 @@ def prepare_features(df: pd.DataFrame, reset_index: bool = True) -> pd.DataFrame
     candle_body = (df["close"] - df["open"]).abs()
     df["candle_body_ratio"] = (candle_body / (candle_range + 1e-9)).clip(0.0, 1.0).astype(np.float32)
 
+    # --- Engulfing pattern detection (vectorized) ---
+    # Bearish engulfing: prev candle bullish → curr candle bearish AND body fully engulfs prev body
+    #   Classic reversal at supply: "ชนโซนแล้วเกิด Engulfing เข้า sell"
+    #   Oracle: H1 bear + supply + pullback + Engulfing → WR 34.6% (+10.8% vs baseline)
+    # Bullish engulfing: symmetric for demand zone reversal entries
+    prev_close = df["close"].shift(1)
+    prev_open  = df["open"].shift(1)
+
+    prev_bullish = prev_close > prev_open
+    curr_bearish = df["close"] < df["open"]
+    bear_engulfs = (df["open"] >= prev_close) & (df["close"] <= prev_open)
+    df["engulfing_bear"] = (prev_bullish & curr_bearish & bear_engulfs).astype(np.float32)
+
+    prev_bearish = prev_close < prev_open
+    curr_bullish = df["close"] > df["open"]
+    bull_engulfs = (df["open"] <= prev_close) & (df["close"] >= prev_open)
+    df["engulfing_bull"] = (prev_bearish & curr_bullish & bull_engulfs).astype(np.float32)
+
+    # --- ATR Contraction (base/consolidation detection) ---
+    # DBR (Drop-Base-Rally): ราคา drop ถึง demand → BASE (consolidate) → RALLY
+    # The "base" = ATR contracting: candles getting smaller = tight range
+    # atr_contraction < 1.0 = current ATR below medium-term average (base forming)
+    # Oracle: Cons60% + demand + ATR contract + body = WR 29.1% (+4.2%) [EDGE]
+    atr_price      = (df["atr_ratio"] * df["close"]).replace(0.0, 1e-9)
+    atr_short      = atr_price.rolling(5,  min_periods=1).mean()   # 5-bar ATR
+    atr_medium     = atr_price.rolling(20, min_periods=5).mean()   # 20-bar ATR
+    df["atr_contraction"] = (atr_short / (atr_medium + 1e-9)).clip(0.3, 2.0).astype(np.float32)
+    # < 0.85 = contracting (base forming), > 1.0 = expanding (impulse/volatile)
+
+    # --- ATR Z-Score (regime filter) ---
+    # Measures: how abnormal is current volatility vs recent history (200 bars = ~50h)
+    # z > 2.0 = EXTREME spike (news event) → WR 16.0% (-8.9%) → BLOCK in mask
+    # z > 1.5 = HIGH vol → WR 24.8% ≈ random → marginal
+    # z -1.5 to 1.5 = NORMAL → WR 28.9% (+4.0%) → trade normally
+    # z < -1.0 = LOW vol → WR 34.7% (+9.8%) → GOOD, do NOT block!
+    # Oracle: excluding z>2.0 → WR 29.4% (+4.5%), lose only 5.6% of opportunities
+    atr_roll200_mean = atr_price.rolling(200, min_periods=50).mean()
+    atr_roll200_std  = atr_price.rolling(200, min_periods=50).std().replace(0.0, 1e-9)
+    df["atr_zscore"] = ((atr_price - atr_roll200_mean) / atr_roll200_std).clip(-4.0, 4.0).fillna(0.0).astype(np.float32)
+
+    # --- M15 Pullback Strength (3-bar normalized price change) ---
+    # Measures: how many ATR units has price moved over the last 3 bars (45 min on M15)
+    # +1.0 = price rose 1 ATR   → strong pullback UP into supply zone
+    # -1.0 = price fell 1 ATR   → strong pullback DOWN into demand zone
+    #  0.0 = price flat (sideways, no directional pullback)
+    # Used in mask Path 2: supply reversal needs pullback_val > 0.3 ATR (price came from below)
+    price_change_3 = (df["close"] - df["close"].shift(3)).fillna(0.0)
+    atr_price = (df["atr_ratio"] * df["close"]).replace(0.0, 1e-9)
+    df["m15_pullback"] = (price_change_3 / atr_price).clip(-3.0, 3.0).astype(np.float32)
+
     df = df.dropna()
     if reset_index:
         df = df.reset_index(drop=True)
@@ -903,6 +975,28 @@ def compute_h1_features(df_m15: pd.DataFrame) -> pd.DataFrame:
     sma_align = (sma_20 - sma_50) / df_h1["close"]
     macd_norm  = df_h1["h1_macd_diff"]
     df_h1["h1_trend_strength"] = (sma_align * 10 + macd_norm * 25).clip(-1.0, 1.0)
+
+    # ── H1 Trend Consistency (rolling 8 H1 bars = 8h window) ──────────────
+    # Root cause fix: bad folds have H1 neutral 72-80% → CHOCH fires on noise
+    #   Fold3 (WR=10%): H1 bull only 10.1% → can't get 60% consecutive
+    #   Fold7 (WR=39%): H1 bull 23.3% → extended bull periods → 60% easy
+    # Using mask_trend_threshold=0.05 (default, matches config)
+    _CONS_THRESHOLD = 0.05
+    _CONS_WINDOW    = 8     # 8 H1 bars = 8 hours
+    df_h1["h1_bull_consistency"] = (
+        (df_h1["h1_trend_strength"] > _CONS_THRESHOLD)
+        .rolling(_CONS_WINDOW, min_periods=4)
+        .mean()
+        .fillna(0.0)
+        .astype(np.float32)
+    )
+    df_h1["h1_bear_consistency"] = (
+        (df_h1["h1_trend_strength"] < -_CONS_THRESHOLD)
+        .rolling(_CONS_WINDOW, min_periods=4)
+        .mean()
+        .fillna(0.0)
+        .astype(np.float32)
+    )
 
     return df_h1[H1_FEATURE_COLUMNS].dropna()
 
@@ -1265,68 +1359,116 @@ class GoldTradingEnv(gym.Env):
 
         step = self.current_step
 
-        # --- Condition 1: H1 trend direction (defines BUY=LONG or BUY=SHORT) ---
+        # --- Condition 1: H1 trend direction — CONSISTENCY check (not snapshot) ---
+        # FIX: snapshot (single bar) caused trading in sideways H1
+        #   Bad folds: H1 neutral 72-80% → brief bull spikes → false CHOCH signal
+        #   Fix: require 60%+ of last 8 H1 bars (8h) in same direction
+        #   Bad fold H1 bull 10% → can't sustain 60% → blocked
+        #   Good fold H1 bull 23% → extended bull runs → passes easily
         trend_col = "h1_trend_strength" if "h1_trend_strength" in self.df.columns \
                     else "d_trend_strength"
         if trend_col not in self.df.columns:
             return np.array([True, False, False], dtype=bool)
 
-        h1_trend = float(self.df[trend_col].iloc[step])
-        trend_bullish = h1_trend >  self.mask_trend_threshold   # LONG setup
-        trend_bearish = h1_trend < -self.mask_trend_threshold   # SHORT setup
+        if "h1_bull_consistency" in self.df.columns:
+            # Precomputed rolling 8-H1-bar consistency (fast O(1) lookup)
+            bull_cons = float(self.df["h1_bull_consistency"].iloc[step])
+            bear_cons = float(self.df["h1_bear_consistency"].iloc[step])
+            trend_bullish = bull_cons >= 0.60   # 6/8 H1 bars = real bull trend
+            trend_bearish = bear_cons >= 0.60   # 6/8 H1 bars = real bear trend
+        else:
+            # Fallback: snapshot (old behaviour)
+            h1_trend = float(self.df[trend_col].iloc[step])
+            trend_bullish = h1_trend >  self.mask_trend_threshold
+            trend_bearish = h1_trend < -self.mask_trend_threshold
+
         if not (trend_bullish or trend_bearish):
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 2 + 3: CHOCH + zone/body (oracle-calibrated, no dist filter) ---
-        #
-        # Oracle v2 results (SWING_WINDOW=20, no dist filter):
-        #   LONG: H1 bull + CHOCH bull                  WR=27.9% N=838  +3.0% EDGE
-        #   LONG: H1 bull + CHOCH bull + demand          WR=34.6% N=332  +9.7% EDGE ← best
-        #   SHORT: H1 bear + CHOCH bear                  WR=28.8% N=583  +3.9% EDGE
-        #   SHORT: H1 bear + CHOCH bear + body           WR=29.3% N=379  +4.4% EDGE ← best
-        #   SHORT: H1 bear + CHOCH bear + supply         WR=27.4% N=223  +2.5% (supply hurts N)
-        #
-        # Key insight:
-        #   LONG benefits from demand zone context (confirms institutional support)
-        #   SHORT benefits from body confirmation (confirms bearish momentum)
-        #   dist threshold NOT used — price is often far from zone when trend/CHOCH fires
-        #
-        if "choch_bullish" not in self.df.columns:
-            return np.array([True, False, False], dtype=bool)
+        # --- Candle body / direction (used by both paths) ---
+        can_long  = False
+        can_short = False
 
-        choch_bull = float(self.df["choch_bullish"].iloc[step])
-        choch_bear = float(self.df["choch_bearish"].iloc[step])
-
-        # CHOCH is the primary signal for both directions
-        can_long_base  = trend_bullish and (choch_bull > 0.1)   # LONG base
-        can_short_base = trend_bearish and (choch_bear > 0.1)   # SHORT base
-
-        if not (can_long_base or can_short_base):
-            return np.array([True, False, False], dtype=bool)
-
-        # Body confirmation (momentum candle aligned with direction)
-        # Oracle: body filter helps both LONG (28.3%) and SHORT (29.3%)
-        # Demand/supply zone stays in OBSERVATION — agent learns when it adds value
-        #   LONG oracle:  H1+CHOCH+body=28.3%, H1+CHOCH+demand+body=34.2%
-        #                 → agent learns "take CHOCH when demand is active" from obs
-        #   SHORT oracle: H1+CHOCH+body=29.3%
         if "candle_body_ratio" in self.df.columns:
-            body_ratio = float(self.df["candle_body_ratio"].iloc[step])
-            close_val  = float(self.df["close"].iloc[step])
-            open_val   = float(self.df["open"].iloc[step])
+            body_ratio  = float(self.df["candle_body_ratio"].iloc[step])
+            close_val   = float(self.df["close"].iloc[step])
+            open_val    = float(self.df["open"].iloc[step])
             bullish_bar = (close_val > open_val) and (body_ratio > 0.4)
             bearish_bar = (close_val < open_val) and (body_ratio > 0.4)
-
-            can_long  = can_long_base  and bullish_bar
-            can_short = can_short_base and bearish_bar
         else:
-            can_long  = can_long_base
-            can_short = can_short_base
+            bullish_bar = True
+            bearish_bar = True
+
+        # ─────────────────────────────────────────────────────────────────
+        # PATH 1: CHOCH Momentum (oracle-proven)
+        #   LONG:  H1 bull + CHOCH bull + bullish body → WR 28.3% (+3.4%)
+        #   SHORT: H1 bear + CHOCH bear + bearish body → WR 29.3% (+5.5%)
+        #   "CHOCH = ราคาทะลุ swing high/low = momentum break"
+        #   Agent learns from demand/supply/SRF in obs → further filters internally
+        # ─────────────────────────────────────────────────────────────────
+        if "choch_bullish" in self.df.columns:
+            choch_bull = float(self.df["choch_bullish"].iloc[step])
+            choch_bear = float(self.df["choch_bearish"].iloc[step])
+
+            if trend_bullish and (choch_bull > 0.1) and bullish_bar:
+                can_long = True   # LONG: momentum breakout confirmed
+            if trend_bearish and (choch_bear > 0.1) and bearish_bar:
+                can_short = True  # SHORT: momentum breakdown confirmed
+
+        # ─────────────────────────────────────────────────────────────────
+        # NOTE: DBR Path2 LONG (demand + ATR contraction + body) tested but removed.
+        #
+        # Oracle shows WR 29.1% standalone, BUT walk-forward with 500k timesteps
+        # showed 1/7 profitable folds when combined with CHOCH.
+        # Root cause: agent cannot learn 2 distinct patterns (CHOCH + DBR) simultaneously
+        # with 500k timesteps — policy becomes confused.
+        #
+        # Solution: keep atr_contraction in OBSERVATION (agent learns contextually)
+        # Re-enable as mask path if timesteps increase to 1M+ in future.
+        #
+        # Oracle reference: Cons60% + demand + atr_contract(<0.85) + body = WR 29.1%
+        # ─────────────────────────────────────────────────────────────────
+
+        # ─────────────────────────────────────────────────────────────────
+        # PATH 2: Supply Reversal SHORT only (oracle-proven)
+        #
+        #   SHORT: H1 bear + supply_active + pullback_up + bearish body
+        #     Oracle (snapshot): WR 28.3% (+4.5%) — 138 trades
+        #     Oracle (cons60%):  WR 24.2% (+0.4%) — 95 trades
+        #     Using snapshot H1 for this path (consistency hurts supply reversal
+        #     because best entry is at START of bear trend, not after 8h consistent)
+        #     "ราคาขึ้นมาชน supply แล้ว reverse ลง" (trader charts 1,2,4)
+        #
+        #   LONG demand reversal: REMOVED
+        #     Oracle: WR 18.6% (-6.3%) = WORSE than random [BAD]
+        #     Reason: "price drops to demand in uptrend" often breaks through
+        #     demand entirely → trade enters, price continues down → SL hit
+        #     Agent still sees demand_active in observation → learns contextually
+        # ─────────────────────────────────────────────────────────────────
+        if "m15_pullback" in self.df.columns:
+            pullback_val = float(self.df["m15_pullback"].iloc[step])
+
+            # SHORT supply reversal: use snapshot H1 (not consistency — see above)
+            # Check raw h1_trend_strength for this path only
+            if (bearish_bar and "supply_active" in self.df.columns):
+                h1_raw = float(self.df[trend_col].iloc[step])
+                supply_val = float(self.df["supply_active"].iloc[step])
+                if h1_raw < -self.mask_trend_threshold and supply_val > 0.5 and pullback_val > 0.3:
+                    can_short = True  # SHORT: pullback into supply → reject
 
         if not (can_long or can_short):
             return np.array([True, False, False], dtype=bool)
 
-        # --- Condition 4: Active session (optional) ---
+        # --- Condition 4: ATR Regime Filter (always on) ---
+        # Block during EXTREME volatility spikes (news events, flash crashes)
+        # Oracle: z>2.0 → WR 16.0% (-8.9%) = worst regime, only 5.6% of bars
+        # Low volatility (z<-1.0) → WR 34.7% = actually GOOD, do NOT block
+        if "atr_zscore" in self.df.columns:
+            atr_z = float(self.df["atr_zscore"].iloc[step])
+            if atr_z > 2.0:  # extreme spike → skip entry
+                return np.array([True, False, False], dtype=bool)
+
+        # --- Condition 5: Active session (optional) ---
         if self.mask_require_session and "is_active_session" in self.df.columns:
             if float(self.df["is_active_session"].iloc[step]) < 0.5:
                 return np.array([True, False, False], dtype=bool)
