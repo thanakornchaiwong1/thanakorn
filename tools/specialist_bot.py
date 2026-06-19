@@ -95,6 +95,10 @@ MAGIC_MAP = {
     "demand_react_long": 2048,      # Demand Reaction LONG (light mirror, user 06-09)
     "momentum_breakout_long": 2049, # Momentum Breakout LONG (vertical impulse, user 06-12)
     "momentum_breakout_short": 2050, # Momentum Breakdown SHORT mirror (user 06-12)
+    "consolidation_breakout_long": 2051,  # CONS-BREAK LONG (user 06-18: 5+bars tight + close pierce)
+    "consolidation_breakout_short": 2052, # CONS-BREAK SHORT mirror
+    "supply_rejection_short": 2053,       # SUPPLY-REJ SHORT (user 06-18: wicks 3+ ที่ supply + red strong = flip)
+    "demand_rejection_long": 2054,        # DEMAND-REJ LONG mirror
 }
 
 # Smart Exit Memory — จำว่าปิดที่ zone ไหน เพื่อ re-enter ที่ zone ตรงข้าม
@@ -115,7 +119,28 @@ _LAST_CLOSE_TIME = None
 _PREV_OPEN_COUNT = 0
 _LAST_TUNER_UPDATE = None   # auto-tuner: เรียนจากผลเทรดทุก ~30 นาที
 _M5_TREND_STATE = {"v": None}  # 2026-06-12: hysteresis ของ M5 fast-trend (คง trend ตอน retest เล็ก)
-ENTRY_COOLDOWN_SEC = 150  # 2.5 นาที — ตัด churn <3min (trend trade ถือยาวไม่กระทบ)
+# 2026-06-17: add 2 logic-fix ที่ดี (จาก session Jun17, cross-val) บน Jun12 base — user "add เฉพาะตัวดี"
+_FIX_ZONE_RANGE_CONFLICT = True  # zone-veto เคารพ range_pos: short ที่ยอด(>65%)/buy ที่ก้น(<35%) ไม่บล็อก. cross-val +$563/+46/−60/+28
+_FIX_ZONE_FLIP = True            # demand ทะลุลง=flip supply(sell) / supply ทะลุขึ้น=flip support(buy). cross-val +$281/+24ไม้
+_AUTO_TUNER_OFF = True           # 2026-06-17 user: ปิด auto-tuner blocking (จะคัด strategy เองจาก live stats). record_entry ยังทำงาน=เก็บสถิติ
+_FIX_NO_BUY_TOP = True           # 2026-06-17 user chart (กรอบแดง buy swing high): weak-long ห้าม buy ส่วนบน M5 range (>65%) = ซื้อยอด
+_FIX_BREAKOUT_EXEMPT = True       # 2026-06-17 user: srf_long breakout-retest buy สูงได้หลังทะลุ — แต่เฉพาะ context_bias≠BEAR
+#   regime/m5_momentum โดนเด้งสั้นในขาลงหลอก (อ่าน trend_bull/UP) → srf_long buy breakout ปลอม แพ้ −128~−186
+#   context_bias (M5 swing 2h: LH+LL) ไม่โดนเด้งหลอก → ใช้มันกรอง downtrend แทน
+# NOTE: ลอง block weak-long ทั้งหมดตอน context_bias=BEAR (Jun17) → FAIL (แพ้ 4/5 window, ไม่แก้ Jun17 เพราะ grind ช้า=NEUTRAL). อย่าทำ
+# NOTE: ลองถอด Gate 1b (sell ชน support) ตามที่ user ขอ → FAIL (Jun9-13 −353: ขายชน support แล้วเด้ง แพ้, Jun17 +0 ไม่แก้). Gate 1b ปกป้องอยู่ อย่าถอด
+_FIX_AUTO_RANGE = True            # 2026-06-17 user (Jun17 inversion: buy ยอด/sell ก้น): auto-range 30-bar M5 (2.5h = range ที่ user ตี) → ห้าม buy บน 1/3 / ห้าม sell ล่าง 1/3 (ยกเว้น momentum_breakout). บังคับ sell ยอด/buy ก้น ทุก regime
+_AUTO_RANGE_TOP = 0.66           # buy ห้ามถ้า pos > นี้
+_AUTO_RANGE_BOT = 0.34           # sell ห้ามถ้า pos < นี้
+_AR_TF = "M5"                    # TF คำนวณ range: "M5" หรือ "M1"
+_AR_BARS = 12                    # M5×12 = 1h. A/B 1h-vs-2.5h: +$920 (Jun9-13 +500, Jun15 −160→+207, Jun16 +58, Jun17 −5). window สั้นปรับตามตลาดเร็วกว่า
+_FIX_IMB_QUALITY = False          # 2026-06-17 ลองแล้ว FAIL −$245 (fvg/imb 3/13W). detector fvg_long ใช้ rule หยาบ (gap 0.3ATR) ≠ "IMB ที่ user เลือกด้วยตา" → ไม่ใช่คุณภาพจริง
+_FIX_SRF_BREAKOUT = True          # 2026-06-18 user สั่ง "ไม่ต้องบล็อค ให้ยิงเก็บ live data": exempt SRF/break_retest/breakout/cons_breakout จาก auto-range+Gate1b+fresh-peak เมื่อไม่สวนเทรนชัด (context_bias bear→block long / bull→block short เท่านั้น)
+_FIX_VBOUNCE = True               # 2026-06-18 user (01:36 V-bounce 4275→4321 พลาด): exempt oversold_bounce จาก Gate 2.7 Stage 2 climax block — detector เองมี m5_ext>1.8+reversal candle = scope แคบ ปลอดภัย
+_AR_TREND_EXEMPT = False         # 2026-06-17 ลองแล้ว FAIL −$892 (แม้ Jun15 ขาขึ้น −250): ผ่อน auto-range ให้ trend buy/sell = ไม้ trend-continuation ที่ block ไว้ = net loser. ครบ 4 วิธี trend-follow FAIL หมด (−685/−914/−892). auto-range mean-reversion (+$791) = edge. อย่าเปิด
+_FIX_TREND_FOLLOW = True         # 2026-06-18 user "buy ตามเทรนไปเรื่อยๆ จนกว่าจะเปลี่ยน": exempt 5 strat user (srf/supply/engulf/star/break_retest) ใน confirmed trend + ADD weak counter-trend block (ส่วนใหม่ที่ขาด)
+_BLOCK_WEAK_COUNTER = True       # 2026-06-18 user: trend BULL → block weak SHORT (supply_react/srf/break_retest/dsf/engulf/htf_retest) เพื่อไม่ให้ sell pullback. mirror for BEAR
+ENTRY_COOLDOWN_SEC = 0    # 2026-06-17 user: ถอด cooldown — มี signal เข้าเลย (เก็บ live data). throttle เหลือ MAX_POS+stacking+1 decision/M1 bar
 
 
 def _in_entry_cooldown() -> bool:
@@ -1934,6 +1959,152 @@ def detect_htf_retest_long(df, atr, htf_zones, min_body_atr=0.2):
     return None
 
 
+# ════════════════════════════════════════════════════════════════════════
+# 2026-06-18 user playbook: "กระจุก ≥5 แท่ง แล้วมี IMB ยิงออกไป = demand/supply"
+# คนละ pattern กับ momentum_breakout (vertical impulse) — อันนี้ต้อง consolidate ก่อน
+# entry = close ของแท่ง breakout เลย (ไม่ retest), SL ใต้/เหนือ consolidation
+# ════════════════════════════════════════════════════════════════════════
+def _cons_flatness(high, low, n):
+    """user 06-18 (ภาพ 4b): ครึ่งแรก vs ครึ่งหลังของ consolidation ต้อง flat (ไม่ wedge/sloped)
+    คืนค่า drift ratio (0 = flat, 1 = ครึ่งหลังเลื่อน 100% ของ range). ใช้ ≤ 0.35 = flat OK."""
+    half = n // 2
+    h1 = max(high[-n:-half]) if half > 0 else high[-1]
+    l1 = min(low[-n:-half]) if half > 0 else low[-1]
+    h2 = max(high[-half:]) if half > 0 else high[-1]
+    l2 = min(low[-half:]) if half > 0 else low[-1]
+    mid1 = (h1 + l1) / 2.0; mid2 = (h2 + l2) / 2.0
+    full_h = max(h1, h2); full_l = min(l1, l2)
+    rng = full_h - full_l
+    return abs(mid2 - mid1) / rng if rng > 0 else 0.0
+
+
+def detect_supply_rejection_short(df, atr, zones, min_wicks=2, min_wick_atr=0.3, min_body_atr=0.3):
+    """user 06-18 playbook: wicks 3+ ที่ supply + red strong candle = SHORT + flip LONG
+    pattern: bot buy ที่ supply → wicks ก่อตัว → IMB red drop → flip sell ทันที"""
+    n = len(df)
+    if n < 7 or not zones: return None
+    h = df["high"].values; l = df["low"].values
+    c = df["close"].values; o = df["open"].values
+    a = float(atr[-1]) if len(atr) else 1.0
+    if a <= 0: return None
+    cur_c = float(c[-1]); cur_o = float(o[-1])
+    # current bar red strong (IMB drop confirms)
+    if cur_c >= cur_o: return None
+    body = cur_o - cur_c
+    if body < min_body_atr * a: return None
+    # หา supply zone ที่ wicks 5 bars แตะอยู่
+    peak5 = float(max(h[-6:-1]))
+    in_sup = None
+    for z in (zones or []):
+        if z.get("type") == "SUPPLY":
+            if z["lo"] - 0.3*a <= peak5 <= z["hi"] + 0.5*a:
+                in_sup = z; break
+    if not in_sup: return None
+    # นับ upper wicks ที่แตะ supply (last 5 closed bars)
+    wc = 0
+    for i in range(-6, -1):
+        body_top = max(o[i], c[i])
+        uw = h[i] - body_top
+        if uw > min_wick_atr * a and h[i] >= in_sup["lo"] - 0.3*a:
+            wc += 1
+    if wc < min_wicks: return None
+    return {"direction": "short", "strategy": "supply_rejection_short",
+            "zone_hi": in_sup["hi"] + 0.5*a, "zone_lo": cur_c - 1.0*a,
+            "reason": f"SUPPLY-REJ SHORT: {wc} wicks @ supply {in_sup['lo']:.1f}-{in_sup['hi']:.1f} + red body {body/a:.1f}ATR (user playbook)"}
+
+
+def detect_demand_rejection_long(df, atr, zones, min_wicks=2, min_wick_atr=0.3, min_body_atr=0.3):
+    """Mirror: wicks 3+ ที่ demand + green strong = LONG + flip SHORT"""
+    n = len(df)
+    if n < 7 or not zones: return None
+    h = df["high"].values; l = df["low"].values
+    c = df["close"].values; o = df["open"].values
+    a = float(atr[-1]) if len(atr) else 1.0
+    if a <= 0: return None
+    cur_c = float(c[-1]); cur_o = float(o[-1])
+    if cur_c <= cur_o: return None
+    body = cur_c - cur_o
+    if body < min_body_atr * a: return None
+    dip5 = float(min(l[-6:-1]))
+    in_dem = None
+    for z in (zones or []):
+        if z.get("type") == "DEMAND":
+            if z["lo"] - 0.5*a <= dip5 <= z["hi"] + 0.3*a:
+                in_dem = z; break
+    if not in_dem: return None
+    wc = 0
+    for i in range(-6, -1):
+        body_bot = min(o[i], c[i])
+        lw = body_bot - l[i]
+        if lw > min_wick_atr * a and l[i] <= in_dem["hi"] + 0.3*a:
+            wc += 1
+    if wc < min_wicks: return None
+    return {"direction": "long", "strategy": "demand_rejection_long",
+            "zone_hi": cur_c + 1.0*a, "zone_lo": in_dem["lo"] - 0.5*a,
+            "reason": f"DEMAND-REJ LONG: {wc} wicks @ demand {in_dem['lo']:.1f}-{in_dem['hi']:.1f} + green body {body/a:.1f}ATR (user playbook)"}
+
+
+def detect_consolidation_breakout_long(df, atr, cons_bars=8, max_range_atr=2.5,
+                                       min_range_atr=0.3, max_drift=0.35, break_min_atr=0.05):
+    """user 06-18 playbook: ≥8 แท่งกระจุก flat (drift≤35%) → แท่งล่าสุดปิดเหนือ range = LONG.
+    Tuned จาก 5 ภาพ user: range 2-5 ATR ดี, sloped (drift>35%) ไม่ดี (ภาพ 4b)."""
+    n = len(df)
+    if n < cons_bars + 2:
+        return None
+    high = df["high"].values; low = df["low"].values
+    close = df["close"].values; open_ = df["open"].values
+    a = float(atr[-1]) if len(atr) else 1.0
+    if a <= 0:
+        return None
+    cons_h = float(max(high[-cons_bars-1:-1]))
+    cons_l = float(min(low[-cons_bars-1:-1]))
+    rng = cons_h - cons_l
+    if rng <= 0 or rng / a > max_range_atr or rng / a < min_range_atr:
+        return None
+    # flatness: กัน wedge/sloped (ภาพ 4b user ว่าไม่ดี)
+    drift = _cons_flatness(high[-cons_bars-1:-1], low[-cons_bars-1:-1], cons_bars)
+    if drift > max_drift:
+        return None
+    cur_c = float(close[-1]); cur_o = float(open_[-1])
+    # close ทะลุ + body bullish (จบแท่ง)
+    if cur_c <= cons_h + break_min_atr * a:
+        return None
+    if cur_c <= cur_o:
+        return None
+    return {"direction": "long", "strategy": "consolidation_breakout_long",
+            "zone_hi": cur_c + 0.5 * a, "zone_lo": cons_l,
+            "reason": f"CONS-BREAK LONG: {cons_bars}+bars flat {cons_l:.1f}-{cons_h:.1f} (rng {rng/a:.1f}ATR, drift {drift*100:.0f}%), close@{cur_c:.1f}"}
+
+
+def detect_consolidation_breakout_short(df, atr, cons_bars=8, max_range_atr=2.5,
+                                        min_range_atr=0.3, max_drift=0.35, break_min_atr=0.05):
+    """Mirror: ≥8 แท่งกระจุก flat → close ใต้ range = SHORT."""
+    n = len(df)
+    if n < cons_bars + 2:
+        return None
+    high = df["high"].values; low = df["low"].values
+    close = df["close"].values; open_ = df["open"].values
+    a = float(atr[-1]) if len(atr) else 1.0
+    if a <= 0:
+        return None
+    cons_h = float(max(high[-cons_bars-1:-1]))
+    cons_l = float(min(low[-cons_bars-1:-1]))
+    rng = cons_h - cons_l
+    if rng <= 0 or rng / a > max_range_atr or rng / a < min_range_atr:
+        return None
+    drift = _cons_flatness(high[-cons_bars-1:-1], low[-cons_bars-1:-1], cons_bars)
+    if drift > max_drift:
+        return None
+    cur_c = float(close[-1]); cur_o = float(open_[-1])
+    if cur_c >= cons_l - break_min_atr * a:
+        return None
+    if cur_c >= cur_o:
+        return None
+    return {"direction": "short", "strategy": "consolidation_breakout_short",
+            "zone_hi": cons_h, "zone_lo": cur_c - 0.5 * a,
+            "reason": f"CONS-BREAK SHORT: {cons_bars}+bars flat {cons_l:.1f}-{cons_h:.1f} (rng {rng/a:.1f}ATR, drift {drift*100:.0f}%), close@{cur_c:.1f}"}
+
+
 def detect_momentum_breakout_long(df, atr, base_lookback=12, min_impulse_atr=1.5,
                                   max_base_atr=3.0, min_break_atr=0.2):
     """MOMENTUM BREAKOUT LONG — impulse แรงทะลุ consolidation base (vertical breakout, ไม่ต้อง retest)
@@ -2981,7 +3152,9 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
                           m15_bullish=None, range_pos=0.5, sr_levels=None, m5_ext=0.0,
                           m15_regime="chop", m5_recent_high5=None, m5_recent_low5=None,
                           m5_last2_dir=None, m1_momentum_str=None,
-                          m5_imb_dir=None, m5_struct_bias=None, context_bias=None):
+                          m5_imb_dir=None, m5_struct_bias=None, context_bias=None,
+                          macro_range_pos=0.5,
+                          pullback_in_bull=False, pullback_in_bear=False):
     """ตัดสินใจ entry ด้วย 3 gate ที่สอดคล้องกัน. คืน (ok, reason, opposing_tp).
 
     ltf_zones (M5/M15) = ใช้ตัดสินทิศ (Gate 1) — เทรด M1 ตีโซน M1/M5/M15
@@ -2991,9 +3164,72 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
     strat = setup.get("strategy", "")
     is_mb = strat in _MOMENTUM_BREAKOUT
     is_rev = strat in _REVERSAL_PATTERN
+    # 2026-06-17 user "เลือกโซนคุณภาพ เช่น มี imb": fvg/imb = โซนที่มี imbalance จริง (คุณภาพ) → exempt mean-reversion guards
+    _IMB_QUALITY = {"fvg_long", "fvg_short", "imb_continuation_long", "imb_continuation_short"}
+    _imb_q = _FIX_IMB_QUALITY and strat in _IMB_QUALITY
+    # 2026-06-18 user "ไม่ต้องบล็อค ให้ยิงเก็บ live data": exempt SRF/break_retest/breakout/cons_breakout
+    #   เงื่อนไข: trend-aligned (context_bias หรือ NEUTRAL อนุญาต — user "เก็บข้อมูล")
+    _SRF_BREAKOUT_STRATS = {"srf_long", "srf_short", "break_retest_long", "break_retest_short",
+                            "breakout_long", "breakout_short",
+                            "consolidation_breakout_long", "consolidation_breakout_short"}
+    # NEW: ไม่เข้มงวด trend-aligned (NEUTRAL ก็ปล่อย) — user สั่ง "ไม่บล็อค"
+    _srf_brk = (_FIX_SRF_BREAKOUT and strat in _SRF_BREAKOUT_STRATS and not (
+        (context_bias == "BEAR" and direction == "long") or
+        (context_bias == "BULL" and direction == "short")))   # บล็อกแค่สวนเทรนชัด
     tol = 0.3 * atr_ref
     # โซนสำหรับ Gate 1: M5/M15 + กรองกว้างเกิน $8 ออก (H4 $20 = หยาบเกิน)
     _g1_zones = [z for z in ltf_zones if (z["hi"] - z["lo"]) <= 8.0]
+
+    # ── 2026-06-17 TREND-FOLLOW (user "ทำไมบอทไม่ sell ตามเทรน") ──
+    # ใน confirmed trend (context_bias = M5 swing structure robust ไม่ lag เหมือน EMA regime):
+    #   ขาลง(BEAR)=ขาย rally ตามเทรน / ขาขึ้น(BULL)=ซื้อ dip → bypass mean-reversion gates
+    #   (1b sell-ชน-support, chop range_pos, auto-range, Gate3 room, climax) ที่มองทุกระดับว่า "ถูกเกินไป"
+    # user playbook ขาลง: SRF retest / SUPPLY zone / bear engulf / shooting star / break_retest (= แนวรับเบรกเป็นแนวต้าน)
+    #   ขายจนกว่าโครงสร้างเปลี่ยน (context_bias เลิกเป็น BEAR = CHOCH). mirror ขาขึ้น. เฉพาะ strategy พวกนี้ (ไม่ใช่ทุก short)
+    _TREND_SELL_STRATS = {"srf_short", "supply_react_short", "supply_zone", "bear_engulf",
+                          "star_short", "break_retest_short"}
+    _TREND_BUY_STRATS = {"srf_long", "demand_react_long", "demand_long", "bull_engulf",
+                         "star_long", "break_retest_long"}
+    _trend_follow = _FIX_TREND_FOLLOW and (
+        (context_bias == "BEAR" and direction == "short" and strat in _TREND_SELL_STRATS) or
+        (context_bias == "BULL" and direction == "long" and strat in _TREND_BUY_STRATS))
+
+    # 2026-06-18 user "buy ตามเทรนจนเปลี่ยน + IMB/cons/engulf = early reversal เร็วกว่า CHOCH":
+    # NARROW LIST: บล็อกเฉพาะ "pullback retest patterns" ที่ fire ทุก swing ของ pullback
+    # ไม่บล็อก: engulf/star/pinbar/momentum_breakout/cons_breakout/fvg/imb = confirmation/reversal signals
+    _WEAK_COUNTER_SHORT = {"supply_react_short", "srf_short", "break_retest_short",
+                           "dsf_short", "htf_retest_short", "trendline_short",
+                           "zone_retest_short", "supply_zone"}
+    _WEAK_COUNTER_LONG = {"demand_react_long", "srf_long", "break_retest_long",
+                          "dsf_long", "htf_retest_long", "trendline_long",
+                          "zone_retest_long", "demand_long"}
+
+    # 2026-06-18: pullback detection (HH+HL / LH+LL pattern M5 12 bars) — รับจาก make_decision
+    # = เร็วกว่า context_bias (ที่ใช้ 25 bars), จับ "rally ค่อยๆ ขึ้น" ที่ context_bias ไม่ flip ทัน
+
+    # strong reversal exempt: pinbar/star/momentum_breakout/oversold_bounce/choch/engulf/cons/fvg/imb
+    # block เฉพาะ weak (pullback retest) — ใน context_bias หรือ M5 pullback ก็ตาม
+    if _BLOCK_WEAK_COUNTER:
+        _bull_active = (context_bias == "BULL") or pullback_in_bull
+        _bear_active = (context_bias == "BEAR") or pullback_in_bear
+        if _bull_active and direction == "short" and strat in _WEAK_COUNTER_SHORT:
+            _src = "ctx=BULL" if context_bias == "BULL" else "M5 HH+HL pullback"
+            return False, f"trend BULL ({_src}) — block weak SHORT [{strat}]: รอ reversal", None
+        if _bear_active and direction == "long" and strat in _WEAK_COUNTER_LONG:
+            _src = "ctx=BEAR" if context_bias == "BEAR" else "M5 LH+LL bounce"
+            return False, f"trend BEAR ({_src}) — block weak LONG [{strat}]: รอ reversal", None
+
+    # ── AUTO-RANGE anti-inversion (user chart Jun17: บอท buy ยอด/sell ก้น = กลับหัว) ──
+    # macro range (M5×_AR_BARS) → บังคับ "sell ยอด/buy ก้น". ยกเว้น momentum_breakout + trend-follow
+    # + trend-aligned (ขาขึ้น buy ตามเทรนได้แม้ยอด / ขาลง sell ตามเทรนได้แม้ก้น) — climax/RR ยังคุมไม้แย่
+    _trend_aligned = _AR_TREND_EXEMPT and (
+        (context_bias == "BULL" and direction == "long") or
+        (context_bias == "BEAR" and direction == "short"))
+    if _FIX_AUTO_RANGE and not is_mb and not _trend_follow and not _trend_aligned and not _imb_q and not _srf_brk:
+        if direction == "long" and macro_range_pos > _AUTO_RANGE_TOP:
+            return False, f"AUTO-RANGE: buy ส่วนบน {macro_range_pos*100:.0f}% ของ range — ห้ามซื้อยอด รอ dip", None
+        if direction == "short" and macro_range_pos < _AUTO_RANGE_BOT:
+            return False, f"AUTO-RANGE: sell ส่วนล่าง {macro_range_pos*100:.0f}% ของ range — ห้ามขายก้น รอ rally", None
 
     # ── Gate 1: REMOVED 2026-06-04 (user: "พลาดหลาย move") ──
     # เดิมบล็อก "LONG ครึ่งบน supply / SHORT ครึ่งล่าง demand" → บล็อก 50% ของ signal
@@ -3006,7 +3242,7 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
     # buy ชน resistance = ซื้อชนเพดาน เด้งลง | sell ชน support = ขายชนพื้น เด้งขึ้น
     # ใช้ find_sr_levels (multi-touch S/R = กำแพงจริง) ไม่ใช่ micro-zone (98% over-block).
     # "ชน" = ราคาห่างกำแพงตรงข้าม ≤ $1.5. ยกเว้น momentum/breakout (ทะลุกำแพงได้)
-    if not is_mb and sr_levels:
+    if not is_mb and sr_levels and not _trend_follow and not _imb_q and not _srf_brk:
         _CHON = 1.5
         if direction == "long":
             for lbl, lvl in sr_levels:
@@ -3069,6 +3305,9 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
                     # FIX #2B: exempt ถ้า trend ไม่สวน (chop/trend_bull + LONG = OK)
                     if _dsf_exempt and m15_regime != "trend_bear":
                         pass  # supply อาจถูก break แล้ว (DSF) → allow LONG ที่มี confirmation
+                    elif (_FIX_ZONE_FLIP and m5_recent_high5 is not None
+                          and m5_recent_high5 > z["hi"] + 0.3 * atr_ref):
+                        pass  # ZONE-FLIP: supply ทะลุขึ้น = flip เป็น support → breakout retest = buy
                     elif _contested and m15_regime == "chop":
                         pass  # Fix A: contested = range trading เท่านั้น (chop). ในเทรนเคารพโซน (2026-06-12)
                     else:
@@ -3078,6 +3317,9 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
                     # FIX #2B: exempt ถ้า trend ไม่สวน (chop/trend_bear + SHORT = OK)
                     if _dsf_exempt and m15_regime != "trend_bull":
                         pass  # demand อาจถูก break แล้ว (DSF) → allow SHORT ที่มี confirmation
+                    elif (_FIX_ZONE_FLIP and m5_recent_low5 is not None
+                          and m5_recent_low5 < z["lo"] - 0.3 * atr_ref):
+                        pass  # ZONE-FLIP: demand ทะลุลง = flip เป็น supply → breakdown retest = sell
                     elif _contested and m15_regime == "chop":
                         pass  # Fix A: contested = range trading เท่านั้น (chop). ในเทรนเคารพโซน (2026-06-12)
                     else:
@@ -3122,10 +3364,10 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
             pass   # vertical breakout = new high/low (range_pos สุดขั้วปกติ) → ยกเว้น range_pos (spike-guard คุมแทน)
         # Fix C REVERTED (2026-06-12): zone-detector กลับมาเคารพ range_pos — กัน sell ก้น/buy ยอด (วินัยเก่า)
         else:
-            # M5 NEUTRAL → range_pos rule (ขายบน ซื้อล่าง)
-            if direction == "short" and range_pos < 0.60:
+            # M5 NEUTRAL → range_pos rule (ขายบน ซื้อล่าง) — ยกเว้น trend-follow (ขาย rally ขาลง/ซื้อ dip ขาขึ้น)
+            if direction == "short" and range_pos < 0.60 and not _trend_follow:
                 return False, f"chop: SHORT ต้องที่ยอด range ({range_pos*100:.0f}%)", None
-            if direction == "long" and range_pos > 0.40:
+            if direction == "long" and range_pos > 0.40 and not _trend_follow:
                 return False, f"chop: LONG ต้องที่ก้น range ({range_pos*100:.0f}%)", None
     elif m15_regime == "trend_bear":
         # ขาลง → SELL rally. 2026-06-09: REVERSAL_AT_WALL ผ่านได้ทันที (candle/structure = proof)
@@ -3138,6 +3380,10 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
             elif strat == "momentum_breakout_long":
                 _rev_ok = True   # 2026-06-12: vertical breakout UP = momentum reversal จริง → ข้าม regime lag
             elif strat in {"zone_retest_long", "hl_retest_long"} and m5_ext > 1.5:
+                _rev_ok = True
+            # 2026-06-18 user (rally $52 4218→4270 บอทไม่เข้า): exempt breakout/cons_break/srf/fvg จาก regime lag
+            #   M15 regime lag 30-60 นาที หลัง dump → block recovery rally. detector พวกนี้ confirm structure ใหม่แล้ว
+            elif strat in {"consolidation_breakout_long", "srf_long", "break_retest_long", "fvg_long"}:
                 _rev_ok = True
             if not _rev_ok:
                 return False, f"เทรนขาลง — LONG ไม่ได้ (ยกเว้น REVERSAL_AT_WALL หรือ zone_retest m5_ext>1.5: ตอนนี้ {m5_ext:+.1f})", None
@@ -3153,6 +3399,9 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
                 _rev_ok = True   # 2026-06-12: vertical breakdown DOWN = momentum reversal จริง → ข้าม regime lag (เคส Jun12 momentum sell ที่ยอด spike)
             elif strat in {"zone_retest_short", "hl_retest_short"} and m5_ext < -1.5:
                 _rev_ok = True
+            # 2026-06-18 mirror: exempt breakdown patterns จาก regime_bull lag
+            elif strat in {"consolidation_breakout_short", "srf_short", "break_retest_short", "fvg_short"}:
+                _rev_ok = True
             if not _rev_ok:
                 return False, f"เทรนขาขึ้น — SHORT ไม่ได้ (ยกเว้น REVERSAL_AT_WALL หรือ zone_retest m5_ext<-1.5: ตอนนี้ {m5_ext:+.1f})", None
 
@@ -3160,7 +3409,7 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
     # 2026-06-05 v1: exempt trend-follow ทั้งหมด → bot SHORT ที่ bounce 21:51 SL -$48 (4361 hit)
     # 2026-06-05 v2: trend-follow ผ่อน 2.5→3.5 threshold (allow trend continuation แต่กัน climax extreme)
     if not is_mb:
-        _is_trend_follow = (
+        _is_trend_follow = _trend_follow or (
             (direction == "short" and m15_regime == "trend_bear") or
             (direction == "long" and m15_regime == "trend_bull")
         )
@@ -3204,7 +3453,7 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
         (direction == "short" and m15_regime == "trend_bear") or
         (direction == "long" and m15_regime == "trend_bull")
     )
-    if not is_mb and strat not in _REVERSAL_AT_WALL:
+    if not is_mb and strat not in _REVERSAL_AT_WALL and not _imb_q and not _srf_brk:
         _FRESH_PROX = 2.0
         _CLIMAX_ATR = 3.0       # ATR M5 > $3 = climax volatility (sharp recent move)
         _CLIMAX_MULT = 1.5      # in climax, proximity threshold scales with ATR
@@ -3214,15 +3463,35 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
             if 0 <= dh <= _FRESH_PROX:
                 return False, f"buy ใกล้ M5 peak สด {m5_recent_high5:.1f} (ห่าง ${dh:.1f} ≤ $2 — supply กำลังก่อ)", None
             # Stage 2 (climax): exempt trend-follow (LONG ใน trend_bull = rally continuation)
-            if not _is_trend_follow_27 and atr_ref > _CLIMAX_ATR and 0 <= dh <= _CLIMAX_MULT * atr_ref:
+            # 2026-06-18: exempt oversold_bounce_long ด้วย — detector require m5_ext>1.8+reversal candle = V-bounce pattern, peak ก่อน crash ไม่ valid
+            _v_bounce_exempt = _FIX_VBOUNCE and strat == "oversold_bounce_long"
+            if not _is_trend_follow_27 and not _v_bounce_exempt and atr_ref > _CLIMAX_ATR and 0 <= dh <= _CLIMAX_MULT * atr_ref:
                 return False, f"buy หลัง climax rally ATR=${atr_ref:.1f} (ห่าง peak ${dh:.1f} ≤ {_CLIMAX_MULT:.1f}×ATR — เด้งกลับเสี่ยง)", None
         if direction == "short" and m5_recent_low5 is not None:
             dl = price - float(m5_recent_low5)
             if 0 <= dl <= _FRESH_PROX:
                 return False, f"sell ใกล้ M5 dip สด {m5_recent_low5:.1f} (ห่าง ${dl:.1f} ≤ $2 — demand กำลังก่อ)", None
             # Stage 2 (climax): exempt trend-follow (SHORT ใน trend_bear = drop continuation)
-            if not _is_trend_follow_27 and atr_ref > _CLIMAX_ATR and 0 <= dl <= _CLIMAX_MULT * atr_ref:
+            # 2026-06-18 mirror: exempt oversold_bounce_short (V-rejection หลัง rally)
+            _v_bounce_exempt = _FIX_VBOUNCE and strat == "oversold_bounce_short"
+            if not _is_trend_follow_27 and not _v_bounce_exempt and atr_ref > _CLIMAX_ATR and 0 <= dl <= _CLIMAX_MULT * atr_ref:
                 return False, f"sell หลัง climax drop ATR=${atr_ref:.1f} (ห่าง dip ${dl:.1f} ≤ {_CLIMAX_MULT:.1f}×ATR — เด้งกลับเสี่ยง)", None
+
+    # ── 2026-06-17 (user chart: กรอบแดง bot buy ที่ swing high) — weak-long ห้ามซื้อส่วนบน range ──
+    # buy ที่ "ยอด local" (>65% ของ M5 5-bar range) = ซื้อยอด rally เล็กๆ ที่กำลังจะกลับ. รอ dip
+    # เฉพาะ weak-long (buy zone/dip) — momentum_breakout/reversal-candle/CHOCH ไม่กระทบ
+    # 2026-06-17: srf_long = breakout-retest → buy สูงได้หลังทะลุ S/R (user สอน) แต่เฉพาะบริบทเทรนไม่ลง
+    #   context_bias (M5 swing 2h: LH+LL=BEAR) robust กว่า regime/m5_momentum (ไม่โดนเด้งสั้นในขาลงหลอก)
+    #   → BEAR (เด้งขาลง) ยังบล็อก srf_long กัน buy breakout ปลอม | NEUTRAL/BULL (range/up) ปล่อย
+    _WEAK_LONG_NO_TOP = {"demand_react_long", "srf_long", "sr_long", "fvg_long",
+                         "zone_first_touch_long", "trendline_long", "hl_retest_long", "zone_retest_long"}
+    if _FIX_BREAKOUT_EXEMPT and context_bias != "BEAR":
+        _WEAK_LONG_NO_TOP = _WEAK_LONG_NO_TOP - {"srf_long"}
+    if (_FIX_NO_BUY_TOP and direction == "long" and strat in _WEAK_LONG_NO_TOP
+            and m5_recent_high5 is not None and m5_recent_low5 is not None):
+        _rng_nt = float(m5_recent_high5) - float(m5_recent_low5)
+        if _rng_nt > 0 and (price - float(m5_recent_low5)) / _rng_nt > 0.65:
+            return False, f"buy ส่วนบน range ({(price-float(m5_recent_low5))/_rng_nt*100:.0f}% ของ M5 range) — ซื้อยอด รอ dip", None
 
     # ── Gate 2.9: M1 MOMENTUM CHECK — STRICT ── (2026-06-08 user: "บอท sell ขณะ momentum UP ไม่หยุด")
     # ก่อนหน้า exempt REVERSAL_AT_WALL ทั้งหมด → hl_retest spam ขายตอน M1 UP = -$503
@@ -3318,7 +3587,7 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
     # ที่ extreme สุดไม่มี room ลงต่อ/ขึ้นต่อ ยกเว้น REVERSAL_AT_WALL (reject ที่ wall)
     # 2026-06-12: ยกเว้น momentum_breakout_long ด้วย — breakout ทำ new high (range_pos ~100%) เป็นปกติ
     #   spike-guard ($40 abs) คุมไม่ให้ไล่ยอดไกลเกินแทน
-    if is_mb and strat not in _REVERSAL_AT_WALL and strat not in ("momentum_breakout_long", "momentum_breakout_short") and range_pos is not None:
+    if is_mb and not _trend_follow and strat not in _REVERSAL_AT_WALL and strat not in ("momentum_breakout_long", "momentum_breakout_short") and range_pos is not None:
         if direction == "short" and range_pos < 0.10:
             return False, f"momentum/breakout SHORT ที่ก้นสุด range_pos {range_pos*100:.0f}% — ไม่มี room ลงต่อ", None
         if direction == "long" and range_pos > 0.90:
@@ -3356,7 +3625,7 @@ def _clean_entry_decision(setup, direction, price, ltf_zones, htf_zones, m5_mome
         if dist < _room_min:
             # 2026-06-12: momentum_breakout ทะลุ wall ได้ (vertical breakout) → ไม่ block, ใช้ RR-based TP
             #   เคส 00:30 srf_long @4107 โดน block "opposing zone 4108 $0.6 no room" แต่ราคาทะลุไป 4164
-            if strat not in ("momentum_breakout_long", "momentum_breakout_short"):
+            if strat not in ("momentum_breakout_long", "momentum_breakout_short") and not _trend_follow:
                 return False, f"opposing zone {nearest:.0f} ห่าง ${dist:.1f} < ${_room_min:.0f} (ไม่มี room)", None
         else:
             opposing_tp = nearest
@@ -3527,6 +3796,18 @@ def make_decision(bridge, classifier):
 
     # Run all detectors: M1 finest → M5 medium → M15 context
     detectors = [
+        # ════ 2026-06-18 user: SUPPLY/DEMAND REJECTION (TOP — flip-trigger) ════
+        # wicks 3+ ที่ supply/demand + red/green strong = reversal entry + flip opposite pos
+        _wrap(lambda d, a: detect_supply_rejection_short(df_m1, atr_m1, _pre_m5_zones), atr_m1),
+        _wrap(lambda d, a: detect_demand_rejection_long(df_m1, atr_m1, _pre_m5_zones), atr_m1),
+        _wrap(lambda d, a: detect_supply_rejection_short(df_m5, atr_m5, _pre_m5_zones), atr_m5),
+        _wrap(lambda d, a: detect_demand_rejection_long(df_m5, atr_m5, _pre_m5_zones), atr_m5),
+        # ════ 2026-06-18 user: CONSOLIDATION BREAKOUT (≥5 แท่งกระจุก + IMB ปิดทะลุ) ════
+        # เข้าที่ close แท่ง breakout เลย (ไม่ retest). ตรง playbook user ที่ส่ง 5 ภาพ
+        _wrap(lambda d, a: detect_consolidation_breakout_long(df_m1, atr_m1), atr_m1),
+        _wrap(lambda d, a: detect_consolidation_breakout_short(df_m1, atr_m1), atr_m1),
+        _wrap(lambda d, a: detect_consolidation_breakout_long(df_m5, atr_m5), atr_m5),
+        _wrap(lambda d, a: detect_consolidation_breakout_short(df_m5, atr_m5), atr_m5),
         # ════ MOMENTUM BREAKOUT (user 2026-06-12: "ขึ้นแบบนี้บอทต้อง buy ตาม momentum") ════
         # vertical impulse ทะลุ base (ไม่ต้อง retest) — จับ rally ที่พุ่งตรงตั้งแต่ต้น move
         # is_mb + ยกเว้น range_pos extreme; spike-guard ($40) กันไล่ยอด. M5 (ชัด) + M1 (เร็ว)
@@ -3868,13 +4149,13 @@ def make_decision(bridge, classifier):
     )
 
     if final_direction and not vetoed:
-        # LONG ห้ามเข้าถ้าอยู่ใน Supply zone จริง (ยกเว้น DSF flip + zone strategies)
-        if final_direction == "long" and _actual_in_supply and not _is_breakout and not _is_zone_strategy:
+        # LONG ห้ามเข้าถ้าอยู่ใน Supply zone จริง (ยกเว้น DSF flip + zone strategies + ZONE-RANGE: buy ที่ก้น)
+        if final_direction == "long" and _actual_in_supply and not _is_breakout and not _is_zone_strategy and not (_FIX_ZONE_RANGE_CONFLICT and h1_range_pos <= 0.35):
             vetoed = True
             if setup:
                 setup["reason"] += f" [VETO: BUY@Supply-zone ({h1_range_pos*100:.0f}%)]"
-        # SHORT ห้ามเข้าถ้าอยู่ใน Demand zone จริง (ยกเว้น DSF flip + zone strategies)
-        elif final_direction == "short" and _actual_in_demand and not _is_breakout and not _is_zone_strategy:
+        # SHORT ห้ามเข้าถ้าอยู่ใน Demand zone จริง (ยกเว้น DSF flip + zone strategies + ZONE-RANGE: short ที่ยอด)
+        elif final_direction == "short" and _actual_in_demand and not _is_breakout and not _is_zone_strategy and not (_FIX_ZONE_RANGE_CONFLICT and h1_range_pos >= 0.65):
             vetoed = True
             if setup:
                 setup["reason"] += f" [VETO: SHORT@Demand-zone ({h1_range_pos*100:.0f}%)]"
@@ -4685,6 +4966,16 @@ def make_decision(bridge, classifier):
                     _m5_range_pos = max(0.0, min(1.0, (_price_now - _rl) / (_rh - _rl)))
             except Exception:
                 pass
+            # 2026-06-17: macro range 30 M5 bars (2.5h = range ที่ user ตี) — robust กว่า 18-bar (ไม่โดน spike หลอก)
+            _macro_rng_pos = 0.5
+            try:
+                _ar_src = df_m1 if _AR_TF == "M1" else df_m5
+                _mrh = float(_ar_src["high"].iloc[-_AR_BARS:].max())
+                _mrl = float(_ar_src["low"].iloc[-_AR_BARS:].min())
+                if _mrh > _mrl and _price_now > 0:
+                    _macro_rng_pos = max(0.0, min(1.0, (_price_now - _mrl) / (_mrh - _mrl)))
+            except Exception:
+                pass
             # Over-extension: ราคาห่าง M5 EMA21 กี่ ATR (+ = ใต้ EMA = ยืดลง, - = เหนือ = ยืดขึ้น)
             # ยืดเกิน 2 ATR = climax/oversold-overbought → เด้งกลับ → อย่าไล่เข้า
             _m5_ext = 0.0
@@ -4765,11 +5056,80 @@ def make_decision(bridge, classifier):
                 _ctx_bias = compute_swing_bias(df_m5, lookback=25)
             except Exception:
                 pass
+            # 2026-06-18 user "ตรงยอดสุดแล้วราคาลง = trend bear / ราคาผ่านยอดเก่า = trend bull ต่อ"
+            # CHOCH-style flip: ราคาเปลี่ยนแรง > 2 ATR จาก 12-bar high/low → FLIP context_bias ตรงทิศ
+            #   = ไม่ cancel เป็น NEUTRAL แต่ FLIP เป็น BEAR/BULL → block ฝั่งสวนเทรนใหม่ + allow ฝั่งตามเทรนใหม่
+            try:
+                _rh12 = float(df_m5["high"].iloc[-13:-1].max())
+                _rl12 = float(df_m5["low"].iloc[-13:-1].min())
+                _drop_from_high = _rh12 - _price_now
+                _rally_from_low = _price_now - _rl12
+                # ใช้ตัวที่แรงกว่า (ราคาเพิ่งทำอะไร)
+                if _drop_from_high > 2.0 * _atr_ref and _drop_from_high > _rally_from_low:
+                    _ctx_bias = "BEAR"   # CHOCH bear: ยอด + drop = bear trend ใหม่
+                elif _rally_from_low > 2.0 * _atr_ref and _rally_from_low > _drop_from_high:
+                    _ctx_bias = "BULL"   # CHOCH bull: ก้น + rally = bull trend ใหม่
+            except Exception:
+                pass
+            # 2026-06-18 user "Morning Star pattern": ถ้ามี bullish/bearish reversal pattern ก่อตัวที่ก้น/ยอด
+            # → flip context_bias = NEUTRAL ทันที (ไม่รอ rally $13) → block weak counter เร็วขึ้น
+            try:
+                # Morning Star: 3 แท่ง M5 — red strong, doji/small body, green strong
+                if len(df_m5) >= 4:
+                    _o = df_m5["open"].values; _c = df_m5["close"].values
+                    _h = df_m5["high"].values; _l = df_m5["low"].values
+                    _b1 = _c[-3] - _o[-3]; _b2 = _c[-2] - _o[-2]; _b3 = _c[-1] - _o[-1]
+                    _range2 = _h[-2] - _l[-2]
+                    _atr_chk = _atr_ref if _atr_ref > 0 else 1.0
+                    # Morning Star (bullish bottom): red big + small body + green big
+                    _ms_bull = (_b1 < -0.8 * _atr_chk and abs(_b2) < 0.3 * _atr_chk and _range2 > 0
+                                and _b3 > 0.8 * _atr_chk and _ctx_bias == "BEAR")
+                    # Evening Star (bearish top): green big + small body + red big
+                    _es_bear = (_b1 > 0.8 * _atr_chk and abs(_b2) < 0.3 * _atr_chk and _range2 > 0
+                                and _b3 < -0.8 * _atr_chk and _ctx_bias == "BULL")
+                    if _ms_bull:
+                        _ctx_bias = "NEUTRAL"   # Morning Star → ไม่ trust BEAR อีก
+                    elif _es_bear:
+                        _ctx_bias = "NEUTRAL"   # Evening Star → ไม่ trust BULL อีก
+                # Liq Sweep reversal: doji + long wick > 1.5 ATR + close > open (bullish) at low
+                if len(df_m5) >= 2:
+                    _o1 = float(df_m5["open"].iloc[-1]); _c1 = float(df_m5["close"].iloc[-1])
+                    _h1 = float(df_m5["high"].iloc[-1]); _l1 = float(df_m5["low"].iloc[-1])
+                    _lower_wick = min(_o1, _c1) - _l1
+                    _upper_wick = _h1 - max(_o1, _c1)
+                    _atr_chk = _atr_ref if _atr_ref > 0 else 1.0
+                    if _lower_wick > 1.5 * _atr_chk and _ctx_bias == "BEAR":
+                        _ctx_bias = "NEUTRAL"   # liq sweep bullish at low → ไม่ trust BEAR
+                    elif _upper_wick > 1.5 * _atr_chk and _ctx_bias == "BULL":
+                        _ctx_bias = "NEUTRAL"   # liq sweep bearish at high → ไม่ trust BULL
+            except Exception:
+                pass
+            # 2026-06-18 pullback detection (M5 12 bars HH+HL / LH+LL) — เร็วกว่า context_bias
+            _pullback_bull = False; _pullback_bear = False
+            try:
+                _h12 = df_m5["high"].iloc[-13:-1].values
+                _l12 = df_m5["low"].iloc[-13:-1].values
+                _sh = []; _sl = []
+                for _i in range(2, len(_h12)-2):
+                    if _h12[_i] >= max(_h12[_i-2:_i+3]): _sh.append(float(_h12[_i]))
+                    if _l12[_i] <= min(_l12[_i-2:_i+3]): _sl.append(float(_l12[_i]))
+                if len(_sh) >= 2 and len(_sl) >= 2:
+                    _hh = _sh[-1] > _sh[-2]; _hl = _sl[-1] > _sl[-2]
+                    _lh = _sh[-1] < _sh[-2]; _ll = _sl[-1] < _sl[-2]
+                    _rh13 = float(df_m5["high"].iloc[-13:].max())
+                    _rl13 = float(df_m5["low"].iloc[-13:].min())
+                    if _hh and _hl and (_rh13 - _price_now) > 0.3 * _atr_ref:
+                        _pullback_bull = True
+                    if _lh and _ll and (_price_now - _rl13) > 0.3 * _atr_ref:
+                        _pullback_bear = True
+            except Exception:
+                pass
             _ck_ok, _ck_reason, _ck_tp = _clean_entry_decision(
                 setup, _orig_direction, _price_now, list(_all_zones), list(_pre_htf_zones),
                 _m5_momentum, _atr_ref, _m15_bullish, _m5_range_pos, _sr_levels_ck, _m5_ext,
                 _m15_regime, _m5_rh5, _m5_rl5, _m5_last2_dir, _m1_mom_str,
-                _m5_imb_dir, _m5_struct, _ctx_bias)
+                _m5_imb_dir, _m5_struct, _ctx_bias, _macro_rng_pos,
+                _pullback_bull, _pullback_bear)
             if _ck_ok:
                 final_direction = _orig_direction
                 vetoed = False
@@ -4857,6 +5217,8 @@ def flip_losing_positions(symbol, new_direction, dec):
         # REVERSAL_AT_WALL (strong candle confirmation) → flip ได้
         "pinbar_long", "pinbar_short", "star_long", "star_short",
         "bull_engulf", "bear_engulf",
+        # 2026-06-18 user: SUPPLY/DEMAND REJECTION = strongest reversal signal → flip ทันที
+        "supply_rejection_short", "demand_rejection_long",
         "srf_bounce_long", "srf_bounce_short",
         "trendline_long", "trendline_short",
         "hl_retest_long", "hl_retest_short",
@@ -5034,9 +5396,16 @@ def submit_order(symbol, direction, lot, atr, magic, comment="",
         # (atr คือ _det_atr ที่ส่งมาจาก TF จริง)
         _tf_tp_target = 3.0 * atr   # TP = 3 ATR ของ TF นั้น
         target_rr = 3.0            # fallback RR (จะถูก override โดย Zone Extension)
+    # 2026-06-18 user "01:00 SELL @4367 TP เร็ว เก็บ $4 แต่ราคาวิ่งต่อ $80": ขยาย TP สำหรับ vertical move patterns
+    #   momentum_breakout + consolidation_breakout = pattern ที่ราคาวิ่งไกล → trailing SL ตามล็อก ride trend ได้
+    _vertical = (comment or "").replace("Spec_", "").lower()
+    if any(_vertical.startswith(p) for p in ("momentum_breakout", "consolidation_breakout")):
+        target_rr = max(target_rr, 7.0)   # TP กว้าง 7× SL (~$30+) ให้ trailing SL ทำงาน ride trend dump/rally
 
     # Night session: cap RR 2.0 (ก่อนหน้า 1.3 ทำให้ TP จิ๋วเกิน — user framework min 1:2)
-    if _is_night:
+    # 2026-06-18: vertical patterns (momentum/cons_breakout) ไม่ cap night → ride trend dump/rally
+    _vertical_pat = any(_vertical.startswith(p) for p in ("momentum_breakout", "consolidation_breakout"))
+    if _is_night and not _vertical_pat:
         target_rr = min(target_rr, 2.0)
         print(f"   [NIGHT-SESSION] h={_now_h}:xx → RR capped 2.0, MIN_SL $1.5, MAX_SL floor $3", flush=True)
 
@@ -5311,6 +5680,24 @@ def submit_order(symbol, direction, lot, atr, magic, comment="",
         "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_FOK,
     }
     r = mt5.order_send(req)
+    # 2026-06-17 resilience: r is None = IPC send failed (order ไม่ถึง server) → reconnect + retry
+    #   กัน "decision ผ่านแต่ order หล่นเงียบ" ตอน MT5 IPC กระตุก (user: บอทไม่เปิด order)
+    _try = 0
+    while r is None and _try < 2:
+        _try += 1
+        try:
+            mt5.initialize()
+        except Exception:
+            pass
+        time.sleep(1)
+        try:
+            _tk = mt5.symbol_info_tick(symbol)
+            if _tk:
+                req["price"] = round(_tk.ask if direction == "long" else _tk.bid, d)
+        except Exception:
+            pass
+        print(f"   [SUBMIT-RETRY {_try}] IPC send failed → reconnect+retry ({comment})", flush=True)
+        r = mt5.order_send(req)
     if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
         return {"ok": False, "error": f"{r.retcode if r else 'None'} {r.comment if r else mt5.last_error()}"}
     return {"ok": True, "order_id": r.order, "entry": r.price, "lot": r.volume, "sl": sl, "tp": tp}
@@ -5782,10 +6169,15 @@ def breakeven_check(symbol):
     # Trailing steps: (trigger_multiplier, sl_offset_multiplier)
     # trigger = entry +/- trigger_mult * sl_dist
     # new_sl  = entry +/- sl_offset_mult * sl_dist
+    # 2026-06-18 user: "SL ที่ BE กำไร 0 ยังไม่ปลอดภัย — ล็อกกำไรเร็วขึ้น"
+    # เพิ่ม step 1.5x และ 2.5x และ 4x — ล็อกกำไรขั้นบันไดละเอียดขึ้น (ไม่กระทบ ride trend ใหญ่)
     TRAIL_STEPS = [
-        (1.0, 0.0),   # Step 1: กำไร 1x → SL = entry + buffer (BE)
-        (2.0, 1.0),   # Step 2: กำไร 2x → SL = entry + 1x SL_dist
-        (3.0, 2.0),   # Step 3: กำไร 3x → SL = entry + 2x SL_dist
+        (1.0, 0.0),   # Step 1: กำไร 1x → BE
+        (1.5, 0.5),   # Step 1.5 (NEW): กำไร 1.5x → ล็อก 0.5x SL_dist
+        (2.0, 1.0),   # Step 2: กำไร 2x → ล็อก 1x
+        (2.5, 1.5),   # Step 2.5 (NEW): กำไร 2.5x → ล็อก 1.5x
+        (3.0, 2.0),   # Step 3: กำไร 3x → ล็อก 2x
+        (4.0, 3.0),   # Step 4 (NEW): กำไร 4x → ล็อก 3x (gain เพิ่ม trailing)
     ]
 
     for pos in positions:
@@ -5950,6 +6342,27 @@ def momentum_exit_check(symbol):
     last_body_pct = abs(last_body_m1) / m1_atr if m1_atr > 0 else 0
     last_bar_bearish_strong = last_body_m1 < 0 and last_body_pct > 0.5
     last_bar_bullish_strong = last_body_m1 > 0 and last_body_pct > 0.5
+    # 2026-06-18 user: M1 higher-low (short reversal) / lower-high (long reversal) — เร็วกว่า M5
+    _m1_higher_low = len(m1_l) >= 3 and m1_l[-1] > m1_l[-2] > m1_l[-3]   # 3 bars HL ติด = uptrend reversal
+    _m1_lower_high = len(m1_h) >= 3 and m1_h[-1] < m1_h[-2] < m1_h[-3]   # 3 bars LH ติด = downtrend reversal
+
+    # 2026-06-18 user "Morning Star ที่ M1 ออกเลย": detect M1 reversal patterns สำหรับ exit เร็ว
+    _m1_morning_star = False; _m1_evening_star = False
+    _m1_liq_sweep_bull = False; _m1_liq_sweep_bear = False
+    if len(m1_c) >= 3 and m1_atr > 0:
+        _b1m1 = m1_c[-3] - m1_o[-3]; _b2m1 = m1_c[-2] - m1_o[-2]; _b3m1 = m1_c[-1] - m1_o[-1]
+        _rng2m1 = m1_h[-2] - m1_l[-2]
+        # Morning Star (bullish reversal): red strong + doji/small + green strong
+        _m1_morning_star = (_b1m1 < -0.7 * m1_atr and abs(_b2m1) < 0.3 * m1_atr
+                            and _rng2m1 > 0 and _b3m1 > 0.7 * m1_atr)
+        # Evening Star (bearish reversal): green strong + doji/small + red strong
+        _m1_evening_star = (_b1m1 > 0.7 * m1_atr and abs(_b2m1) < 0.3 * m1_atr
+                            and _rng2m1 > 0 and _b3m1 < -0.7 * m1_atr)
+        # Liq sweep on M1 last bar: long lower wick (bullish sweep) / long upper wick (bearish sweep)
+        _lw_m1 = min(m1_o[-1], m1_c[-1]) - m1_l[-1]
+        _uw_m1 = m1_h[-1] - max(m1_o[-1], m1_c[-1])
+        _m1_liq_sweep_bull = _lw_m1 > 1.5 * m1_atr and _b3m1 > 0
+        _m1_liq_sweep_bear = _uw_m1 > 1.5 * m1_atr and _b3m1 < 0
 
     info = mt5.symbol_info(symbol)
     d = info.digits if info else 2
@@ -5983,6 +6396,13 @@ def momentum_exit_check(symbol):
             exit_reason = f"IMB BULL breakout ({pnl:+.1f})"
         elif direction == "long" and _red_strong_2:
             exit_reason = f"IMB BEAR breakdown ({pnl:+.1f})"
+        # 2026-06-18 user "Morning Star M1 ออกเลย — ขาดทุนได้": M1 reversal pattern ปิดทันทีไม่ดู pnl
+        elif direction == "short" and (_m1_morning_star or _m1_liq_sweep_bull):
+            _pat = "Morning Star" if _m1_morning_star else "Liq Sweep Bull"
+            exit_reason = f"M1 {_pat} ${pnl:+.1f} (reversal — exit regardless)"
+        elif direction == "long" and (_m1_evening_star or _m1_liq_sweep_bear):
+            _pat = "Evening Star" if _m1_evening_star else "Liq Sweep Bear"
+            exit_reason = f"M1 {_pat} ${pnl:+.1f} (reversal — exit regardless)"
         if exit_reason:
             pass  # ไปต่อ close logic ข้างล่าง
         elif pnl <= 0.5:
@@ -6001,11 +6421,25 @@ def momentum_exit_check(symbol):
                 exit_reason = f"M5 CHOCH BEAR +${pnl:.1f}"
             elif pnl >= 25.0 and last_bar_bearish_strong and _m5_weak_for_long:
                 exit_reason = f"take big profit +${pnl:.1f} (M5 lower-high)"
+            # 2026-06-18 user: BIG WINNER LONG ($50+) → ปิดเร็วบน M1 lower-high
+            # 2026-06-18 user "Morning/Evening Star ที่ M1 ออกเลย — ขาดทุนได้เลย": close ทันทีบน signal ไม่ดู pnl
+            elif _m1_evening_star or _m1_liq_sweep_bear:
+                _pat = "Evening Star" if _m1_evening_star else "Liq Sweep Bear"
+                exit_reason = f"M1 {_pat} ${pnl:+.1f} (reversal signal — exit regardless)"
+            elif pnl >= 50.0 and last_bar_bearish_strong and _m1_lower_high:
+                exit_reason = f"BIG WINNER take profit +${pnl:.1f} (M1 lower-high)"
         elif direction == "short":
             if _choch_bull and pnl >= 10.0:
                 exit_reason = f"M5 CHOCH BULL +${pnl:.1f}"
             elif pnl >= 25.0 and last_bar_bullish_strong and _m5_weak_for_short:
                 exit_reason = f"take big profit +${pnl:.1f} (M5 higher-low)"
+            # 2026-06-18 user: BIG WINNER ($50+) → ปิดเร็วบน M1 reversal (ไม่ต้องรอ M5)
+            # 2026-06-18 user mirror: close SHORT บน Morning Star/Liq Sweep bullish — exit regardless of pnl
+            elif _m1_morning_star or _m1_liq_sweep_bull:
+                _pat = "Morning Star" if _m1_morning_star else "Liq Sweep Bull"
+                exit_reason = f"M1 {_pat} ${pnl:+.1f} (reversal signal — exit regardless)"
+            elif pnl >= 50.0 and last_bar_bullish_strong and _m1_higher_low:
+                exit_reason = f"BIG WINNER take profit +${pnl:.1f} (M1 higher-low)"
 
         if exit_reason:
             close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
@@ -6462,10 +6896,29 @@ def main():
             print(f"LOOP mode — PRIMARY=M1, symbol={args.symbol}, max_lot={args.max_lot}, live={args.live}\n", flush=True)
             last_bar = None
             while True:
-                has_new, latest = bridge.is_new_bar("M1", last_bar)  # check every M1 bar (1 min)
+                # 2026-06-17: resilience — กัน MT5 IPC error crash บอท (re-apply หลัง revert Jun12)
+                try:
+                    has_new, latest = bridge.is_new_bar("M1", last_bar)  # check every M1 bar (1 min)
+                except Exception as _ipc_err:
+                    print(f"⚠️ [LOOP-ERR is_new_bar] {type(_ipc_err).__name__}: {_ipc_err} — reconnect+retry 15s", flush=True)
+                    try:
+                        mt5.initialize()
+                    except Exception:
+                        pass
+                    time.sleep(15)
+                    continue
                 if has_new:
                     last_bar = latest
-                    dec = make_decision(bridge, classifier)
+                    try:
+                        dec = make_decision(bridge, classifier)
+                    except Exception as _md_err:
+                        print(f"⚠️ [LOOP-ERR make_decision] {type(_md_err).__name__}: {_md_err} — reconnect+retry 15s", flush=True)
+                        try:
+                            mt5.initialize()
+                        except Exception:
+                            pass
+                        time.sleep(15)
+                        continue
 
                     # ── Anti-Churn: ตรวจ position count ลดลง = เพิ่งมีปิด → ตั้ง cooldown ──
                     try:
@@ -6507,8 +6960,9 @@ def main():
 
                         else:
                             # Step 2: Stacking — 2026-06-09 user: "ถ้ามี strategy ทิศทางเดียวกันก็เปิดซ้ำได้"
-                            # ลด $5 → $2 = scale-in ที่ระดับใหม่ (กัน spam ที่ราคาเดิม)
-                            _stack_min = 2.0
+                            # 2026-06-18 user: "ซ้ำหรือใกล้ที่เดิมก็ได้ถ้ามั่นใจ แต่ไม่เกิน 3" → ลด $2 → $0 (= ไม่มี min distance)
+                            #   MAX_POS=3 (same dir) คุมเพดานแล้ว + signal cooldown ต่อ strategy คุม spam
+                            _stack_min = 0.0
                             _cur_px = float(dec.get('live_bid', 0) or 0)
                             _same_dir_near = [
                                 p for p in (xau_positions or [])
@@ -6555,7 +7009,7 @@ def main():
                                     can_enter = False
 
                                 # ── Auto-Tuner: combo (strategy×regime) ขาดทุนซ้ำ → skip (เรียนจากผลเทรด) ──
-                                if can_enter and auto_tuner is not None:
+                                if can_enter and auto_tuner is not None and not _AUTO_TUNER_OFF:
                                     _reg = dec.get('regime', '')
                                     # Auto-tuner: ทุก strategy ผูก (VIP bypass = ไม่เรียนรู้ = ขาดทุนซ้ำ)
                                     # ยกเว้น break_retest (proven winner historical +$155 WR 77%) — อย่าให้ noise blocking
@@ -6667,7 +7121,7 @@ def main():
                             print(f"[RE-ERR] reentry error: {e}", flush=True)
 
                         # ── Auto-Tuner: เรียนจากผลเทรดเองทุก ~30 นาที (self-learning) ──
-                        if auto_tuner is not None:
+                        if auto_tuner is not None and not _AUTO_TUNER_OFF:
                             try:
                                 _now_t = dt.datetime.now()
                                 if (_LAST_TUNER_UPDATE is None or
